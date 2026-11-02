@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -132,8 +134,18 @@ class NormalizeExportTests(unittest.TestCase):
         messages = result["conversations"][0]["messages"]
 
         self.assertEqual(
-            [message["content"]["text"] for message in messages],
+            result["format"], "conversation-knowledge-curator.normalized.v2"
+        )
+        self.assertEqual(
+            set(result), {"format", "source_sha256", "conversations"}
+        )
+        self.assertEqual(result["conversations"][0]["source_index"], 0)
+        self.assertEqual(
+            [message["text"] for message in messages],
             ["Visible question", "Visible answer"],
+        )
+        self.assertEqual(
+            set(messages[0]), {"message_id", "role", "create_time", "text"}
         )
         serialized = json.dumps(result)
         self.assertNotIn("Inactive branch answer", serialized)
@@ -144,7 +156,7 @@ class NormalizeExportTests(unittest.TestCase):
     def test_all_branches_includes_visible_inactive_branch(self) -> None:
         result = chatgpt_export.normalize_export(FIXTURE_PATH, branch="all")
         texts = [
-            message["content"]["text"]
+            message["text"]
             for message in result["conversations"][0]["messages"]
         ]
 
@@ -152,17 +164,141 @@ class NormalizeExportTests(unittest.TestCase):
             texts, ["Visible question", "Inactive branch answer", "Visible answer"]
         )
 
-    def test_missing_current_node_warns_and_uses_all_nodes(self) -> None:
+    def test_missing_current_node_skips_active_conversation(self) -> None:
         data = chatgpt_export.load_json(FIXTURE_PATH)
         del data[0]["current_node"]
         conversations, _ = chatgpt_export.conversation_objects(data)
 
-        normalized, warnings = chatgpt_export.normalize_conversation(
+        normalized, warnings, reason = chatgpt_export.normalize_conversation(
             conversations[0], "active"
         )
 
+        self.assertIsNone(normalized)
         self.assertTrue(warnings)
-        self.assertEqual(len(normalized["messages"]), 3)
+        self.assertEqual(reason, "active_branch_unavailable")
+
+    def test_missing_current_node_is_recorded_in_normalized_output(self) -> None:
+        data = chatgpt_export.load_json(FIXTURE_PATH)
+        del data[0]["current_node"]
+        source = {
+            "kind": "json_file",
+            "path": str(FIXTURE_PATH),
+            "size_bytes": FIXTURE_PATH.stat().st_size,
+            "sha256": chatgpt_export.sha256_file(FIXTURE_PATH),
+        }
+
+        result = chatgpt_export.normalize_loaded_export(data, source, "active")
+
+        self.assertEqual(result.document["conversations"], [])
+        self.assertNotIn("skipped_conversations", result.document)
+        self.assertEqual(result.diagnostics["skipped_conversation_count"], 1)
+        self.assertEqual(
+            result.diagnostics["skipped_conversations"][0]["reason_code"],
+            "active_branch_unavailable",
+        )
+
+    def test_normalize_source_rejects_unsupported_inspection(self) -> None:
+        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
+            path = Path(directory) / "unknown.json"
+            path.write_text('{"unknown": true}', encoding="utf-8")
+            resolved = chatgpt_export.resolve_input(path)
+            source = resolved.sources[0]
+            inspection = chatgpt_export.inspect_source(source)
+
+            with self.assertRaises(chatgpt_export.ExportError):
+                chatgpt_export.normalize_source(
+                    source, inspection=inspection
+                )
+
+    def test_directory_normalization_writes_per_source_files_and_manifest(self) -> None:
+        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
+            input_dir = Path(directory) / "imports"
+            input_dir.mkdir()
+            (input_dir / "valid.json").write_bytes(FIXTURE_PATH.read_bytes())
+            (input_dir / "invalid.json").write_text("{", encoding="utf-8")
+            archive_path = input_dir / "export.zip"
+            with zipfile.ZipFile(
+                archive_path, "w", compression=zipfile.ZIP_DEFLATED
+            ) as archive:
+                archive.writestr("conversations.json", FIXTURE_PATH.read_bytes())
+            output_dir = Path(directory) / "normalized"
+
+            manifest = chatgpt_export.normalize_input(input_dir, output_dir)
+
+            self.assertEqual(manifest["status"], "completed_with_issues")
+            self.assertEqual(manifest["summary"]["normalized_source_count"], 2)
+            self.assertEqual(manifest["summary"]["skipped_source_count"], 1)
+            self.assertEqual(manifest["summary"]["failed_source_count"], 0)
+            self.assertEqual(len(list(output_dir.glob("*.normalized.json"))), 2)
+            self.assertTrue((output_dir / "manifest.json").is_file())
+            persisted_manifest = json.loads(
+                (output_dir / "manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(persisted_manifest, manifest)
+            self.assertNotIn("Visible question", json.dumps(manifest))
+            normalized_entries = [
+                entry
+                for entry in manifest["entries"]
+                if entry["status"] == "normalized"
+            ]
+            self.assertTrue(
+                all("normalization" in entry for entry in normalized_entries)
+            )
+            normalized_sources = [
+                entry["source"]["kind"]
+                for entry in normalized_entries
+            ]
+            self.assertEqual(normalized_sources, ["zip_member", "json_file"])
+            normalized_path = output_dir / normalized_entries[0]["output"]
+            normalized_document = json.loads(
+                normalized_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                set(normalized_document),
+                {"format", "source_sha256", "conversations"},
+            )
+            self.assertEqual(
+                normalized_document["source_sha256"],
+                normalized_entries[0]["source"]["sha256"],
+            )
+            self.assertEqual(
+                set(normalized_entries[0]["normalization"]),
+                {
+                    "branch_policy",
+                    "source_conversation_count",
+                    "normalized_conversation_count",
+                    "skipped_conversation_count",
+                    "message_count",
+                    "skipped_conversations",
+                    "warnings",
+                },
+            )
+
+    def test_normalization_refuses_existing_output_directory(self) -> None:
+        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
+            output_dir = Path(directory) / "normalized"
+            output_dir.mkdir()
+
+            with self.assertRaises(chatgpt_export.ExportError):
+                chatgpt_export.normalize_input(FIXTURE_PATH, output_dir)
+
+    def test_normalize_cli_writes_output_directory_and_manifest(self) -> None:
+        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
+            output_dir = Path(directory) / "normalized"
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                exit_code = chatgpt_export.main(
+                    ["normalize", str(FIXTURE_PATH), str(output_dir)]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertTrue((output_dir / "manifest.json").is_file())
+            printed_manifest = json.loads(stdout.getvalue())
+            self.assertEqual(
+                printed_manifest["format"],
+                "conversation-knowledge-curator.manifest.v1",
+            )
 
     def test_output_creation_never_overwrites(self) -> None:
         with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
@@ -172,7 +308,9 @@ class NormalizeExportTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 chatgpt_export.write_new_json(output, {"second": True})
 
-            self.assertEqual(json.loads(output.read_text(encoding="utf-8")), {"first": True})
+            self.assertEqual(
+                json.loads(output.read_text(encoding="utf-8")), {"first": True}
+            )
 
     def test_same_input_and_output_is_rejected_by_cli(self) -> None:
         with self.assertRaises(SystemExit) as raised:

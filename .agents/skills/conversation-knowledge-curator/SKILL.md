@@ -20,8 +20,8 @@ description: 将 ChatGPT 对话导出 JSON 整理为可审核的知识候选。�
 1. 确定待处理的输入路径。输入可以是单个 JSON 文件、ZIP 压缩包，或包含多个 JSON/ZIP 的目录。不要自行扫描无关的项目目录。
 2. 先运行 `scripts/chatgpt_export.py inspect <input-path>`。由程序统一检查路径、识别输入类型、确定性发现候选 JSON、检查 JSON 语法与顶层容器，并检查 ChatGPT 对话结构。检查报告不得回显消息正文。
 3. 根据 inspect 报告判断输入是否受支持。只有出现不支持的容器、解析警告或字段含义不明确时，才读取 [references/chatgpt-export-json.md](references/chatgpt-export-json.md)。不得凭记忆猜测字段含义；无法确认的来源暂停标准化。
-4. 当前 `normalize` 只接受已经确认受支持的单个 JSON 文件：运行 `scripts/chatgpt_export.py normalize <input.json> <new-output.json>`。当 `current_node` 有效时，默认只选择当前活动分支；只有任务明确需要全部分支时才使用 `--branch all`。目录和 ZIP 的批量标准化属于后续增量，不得通过不安全的全量解压绕过该边界。
-5. 标准化输出必须通过源文件路径和 SHA-256 保持可追溯。不得静默丢弃解析器警告。
+4. 运行 `scripts/chatgpt_export.py normalize <input-path> <new-output-directory>`。程序复用 inspect 的输入发现和结构判断，只标准化状态为 `supported` 的普通 JSON 或 ZIP 成员；目录中的每个来源独立生成标准化文件。当 `current_node` 有效时，默认只选择当前活动分支；只有任务明确需要全部分支时才使用 `--branch all`。
+5. 新输出目录必须尚不存在。标准化文件只保留来源内容 SHA-256 和用户可见对话；完整路径、成员路径、分支策略、统计、跳过原因和警告集中写入 `manifest.json`，不得静默丢弃检查结果。
 6. 在后续语义阶段判断对话价值、提取原子知识候选、分类，并与现有 Markdown 文档匹配。每个候选必须引用来源对话 ID 和消息 ID。
 7. 将新增、融合和冲突建议整理为审核包，并附带 Markdown diff。明确标记不确定陈述、时效性事实和冲突。
 8. 只有用户确认变更范围后才能应用已审核的 diff。对应 Markdown 变更成功后，才能更新 SQLite 索引。
@@ -33,7 +33,10 @@ description: 将 ChatGPT 对话导出 JSON 整理为可审核的知识候选。�
 当前工具输出：
 
 - `conversation-knowledge-curator.inspection.v1` 检查报告：包含输入类型、候选来源、ZIP 统计、JSON 顶层结构、对话数量、实际观察到的角色和内容类型、排除原因及警告；
-- `conversation-knowledge-curator.normalized.v1` 格式的标准化 JSON：包含来源信息、选中的用户可见消息和警告。
+- `conversation-knowledge-curator.normalized.v2` 格式的标准化 JSON：只包含来源内容 SHA-256 和选中的用户可见消息；这是对旧版 v1 的不兼容升级。
+- `conversation-knowledge-curator.manifest.v1` 批量清单：记录完整来源、输入输出、分支策略、处理状态、诊断和汇总数量。
+
+修改标准化字段、分支策略或输出兼容性时，读取 [references/normalized-v2.md](references/normalized-v2.md)。修改批量输出命名、状态或汇总规则时，读取 [references/normalization-manifest-v1.md](references/normalization-manifest-v1.md)。
 
 后续知识处理结果应保持为相互独立的产物，包括提取候选、文档匹配、冲突说明和 patch/diff。所有生成结果在获得批准前都只是建议。
 

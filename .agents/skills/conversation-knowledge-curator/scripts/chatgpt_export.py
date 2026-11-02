@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 import zipfile
 from collections import Counter
@@ -18,8 +19,9 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 
-FORMAT_VERSION = "conversation-knowledge-curator.normalized.v1"
+FORMAT_VERSION = "conversation-knowledge-curator.normalized.v2"
 INSPECTION_FORMAT_VERSION = "conversation-knowledge-curator.inspection.v1"
+MANIFEST_FORMAT_VERSION = "conversation-knowledge-curator.manifest.v1"
 ELIGIBLE_ROLES = {"user", "assistant"}
 HIDDEN_CONTENT_TYPES = {
     "analysis",
@@ -71,6 +73,15 @@ class ResolvedInput:
     zip_file_count: int
     other_file_count: int
     warnings: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class NormalizationResult:
+    """分离精简内容、完整来源信息和标准化诊断。"""
+
+    document: dict[str, Any]
+    source: dict[str, Any]
+    diagnostics: dict[str, Any]
 
 
 DEFAULT_INSPECTION_LIMITS = InspectionLimits()
@@ -480,22 +491,16 @@ def active_node_ids(
 
     current = conversation.get("current_node")
     if not isinstance(current, str) or current not in mapping:
-        return stable_all_node_ids(mapping), (
-            "current_node 缺失或无效；已确定性遍历全部 mapping 节点"
-        )
+        return [], "current_node 缺失或无效；已跳过当前对话"
 
     reversed_path: list[str] = []
     seen: set[str] = set()
     node_id: str | None = current
     while node_id is not None:
         if node_id in seen:
-            return stable_all_node_ids(mapping), (
-                "活动分支的 parent 链存在循环；已确定性遍历全部 mapping 节点"
-            )
+            return [], "活动分支的 parent 链存在循环；已跳过当前对话"
         if node_id not in mapping:
-            return stable_all_node_ids(mapping), (
-                "活动分支的 parent 链引用未知节点；已确定性遍历全部 mapping 节点"
-            )
+            return [], "活动分支的 parent 链引用未知节点；已跳过当前对话"
         seen.add(node_id)
         reversed_path.append(node_id)
         node = mapping[node_id]
@@ -552,7 +557,11 @@ def exclusion_reason(message: dict[str, Any]) -> str | None:
         return "hidden_channel"
 
     recipient = lower_string(message.get("recipient"))
-    if role == "assistant" and recipient and recipient not in VISIBLE_ASSISTANT_RECIPIENTS:
+    if (
+        role == "assistant"
+        and recipient
+        and recipient not in VISIBLE_ASSISTANT_RECIPIENTS
+    ):
         return "non_user_recipient"
     return None
 
@@ -580,7 +589,11 @@ def extract_text(message: dict[str, Any]) -> str:
     pieces: list[str] = []
     parts = content.get("parts")
     if isinstance(parts, list):
-        pieces.extend(text for part in parts if (text := text_from_part(part)) is not None)
+        pieces.extend(
+            text
+            for part in parts
+            if (text := text_from_part(part)) is not None
+        )
     elif isinstance(content.get("text"), str):
         pieces.append(content["text"])
     return "\n".join(piece for piece in pieces if piece).strip()
@@ -588,28 +601,32 @@ def extract_text(message: dict[str, Any]) -> str:
 
 def selected_nodes(
     conversation: dict[str, Any], branch: str
-) -> tuple[dict[str, Any], list[str], list[str]]:
+) -> tuple[dict[str, Any], list[str], list[str], str | None]:
     """根据分支策略选择节点，并返回不会中断处理的结构警告。"""
 
     mapping = mapping_for(conversation)
     warnings: list[str] = []
     if not mapping:
         warnings.append("对话缺少 mapping 对象，或 mapping 为空")
-        return mapping, [], warnings
+        return mapping, [], warnings, "missing_mapping"
     if branch == "all":
-        return mapping, stable_all_node_ids(mapping), warnings
+        return mapping, stable_all_node_ids(mapping), warnings, None
     node_ids, warning = active_node_ids(conversation, mapping)
     if warning:
         warnings.append(warning)
-    return mapping, node_ids, warnings
+        return mapping, node_ids, warnings, "active_branch_unavailable"
+    return mapping, node_ids, warnings, None
 
 
 def normalize_conversation(
-    conversation: dict[str, Any], branch: str
-) -> tuple[dict[str, Any], list[str]]:
+    conversation: dict[str, Any], branch: str, source_index: int = 0
+) -> tuple[dict[str, Any] | None, list[str], str | None]:
     """把一个对话标准化为用户可见消息列表。"""
 
-    mapping, node_ids, warnings = selected_nodes(conversation, branch)
+    mapping, node_ids, warnings, skip_reason = selected_nodes(conversation, branch)
+    if skip_reason is not None:
+        return None, warnings, skip_reason
+
     messages: list[dict[str, Any]] = []
     for node_id in node_ids:
         node = mapping.get(node_id)
@@ -621,25 +638,18 @@ def normalize_conversation(
             continue
         author = message.get("author")
         assert isinstance(author, dict)  # exclusion_reason 已确认作者结构有效
-        parent = node.get("parent") if isinstance(node, dict) else None
         messages.append(
             {
                 "message_id": message.get("id") or node_id,
-                "node_id": node_id,
-                "parent_node_id": parent if isinstance(parent, str) else None,
                 "role": lower_string(author.get("role")),
-                "author_name": (
-                    author.get("name")
-                    if isinstance(author.get("name"), str)
-                    else None
-                ),
                 "create_time": message.get("create_time"),
-                "content": {"type": "text", "text": text},
+                "text": text,
             }
         )
 
     return (
         {
+            "source_index": source_index,
             "conversation_id": (
                 conversation.get("id") or conversation.get("conversation_id")
             ),
@@ -650,10 +660,10 @@ def normalize_conversation(
             ),
             "create_time": conversation.get("create_time"),
             "update_time": conversation.get("update_time"),
-            "branch_selection": branch,
             "messages": messages,
         },
         warnings,
+        None,
     )
 
 
@@ -667,30 +677,78 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def normalize_export(path: Path, branch: str = "active") -> dict[str, Any]:
-    """标准化整个导出文件，并附加来源和警告信息。"""
+def normalize_loaded_export(
+    data: Any,
+    source: dict[str, Any],
+    branch: str = "active",
+) -> NormalizationResult:
+    """标准化已加载且结构受支持的导出数据。"""
 
-    data = load_json(path)
+    source_sha256 = source.get("sha256")
+    if not isinstance(source_sha256, str) or not source_sha256:
+        raise ExportError("标准化来源缺少有效的 SHA-256")
+
     conversations, envelope = conversation_objects(data)
     normalized: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
     for index, conversation in enumerate(conversations):
-        item, item_warnings = normalize_conversation(conversation, branch)
-        normalized.append(item)
+        item, item_warnings, skip_reason = normalize_conversation(
+            conversation, branch, source_index=index
+        )
+        if item is not None:
+            normalized.append(item)
+        else:
+            skipped.append(
+                {
+                    "source_index": index,
+                    "conversation_id": (
+                        conversation.get("id")
+                        or conversation.get("conversation_id")
+                    ),
+                    "reason_code": skip_reason,
+                    "message": item_warnings[0] if item_warnings else None,
+                }
+            )
         warnings.extend(
             {"conversation_index": index, "message": warning}
             for warning in item_warnings
         )
-    return {
-        "format": FORMAT_VERSION,
-        "source": {
-            "path": str(path.resolve()),
-            "sha256": sha256_file(path),
-            "container": envelope,
-        },
-        "conversations": normalized,
+    source_with_container = {**source, "container": envelope}
+    diagnostics = {
+        "branch_policy": branch,
+        "source_conversation_count": len(conversations),
+        "normalized_conversation_count": len(normalized),
+        "skipped_conversation_count": len(skipped),
+        "message_count": sum(len(item["messages"]) for item in normalized),
+        "skipped_conversations": skipped,
         "warnings": warnings,
     }
+    document = {
+        "format": FORMAT_VERSION,
+        "source_sha256": source_sha256,
+        "conversations": normalized,
+    }
+    return NormalizationResult(
+        document=document,
+        source=source_with_container,
+        diagnostics=diagnostics,
+    )
+
+
+def normalize_export(path: Path, branch: str = "active") -> dict[str, Any]:
+    """兼容旧调用方式，标准化单个普通 JSON 文件。"""
+
+    resolved_path = path.expanduser().resolve()
+    data = load_json(resolved_path)
+    source = {
+        "kind": "json_file",
+        "path": str(resolved_path),
+        "size_bytes": resolved_path.stat().st_size,
+        "sha256": sha256_file(resolved_path),
+    }
+    inspect_loaded_export(data, source)
+    return normalize_loaded_export(data, source, branch).document
 
 
 def inspect_loaded_export(
@@ -862,6 +920,175 @@ def inspection_exit_code(report: dict[str, Any]) -> int:
     return 0 if report.get("status") == "ok" else 1
 
 
+def normalize_source(
+    source: InputSource,
+    branch: str = "active",
+    limits: InspectionLimits = DEFAULT_INSPECTION_LIMITS,
+    inspection: dict[str, Any] | None = None,
+) -> NormalizationResult:
+    """只标准化已经通过相同结构检查逻辑的单个输入来源。"""
+
+    source_inspection = inspection or inspect_source(source, limits)
+    if source_inspection.get("status") != "supported":
+        raise ExportError(
+            "输入来源未通过 inspect，不能标准化："
+            f"{source_inspection.get('status', 'unknown')}"
+        )
+
+    payload = read_input_source(source, limits)
+    descriptor = source_descriptor(source, sha256_bytes(payload))
+    inspected_sha256 = source_inspection.get("source", {}).get("sha256")
+    if inspected_sha256 != descriptor["sha256"]:
+        raise ExportError("输入内容在 inspect 后发生变化，请重新执行检查")
+
+    data = json.loads(payload.decode("utf-8-sig"))
+    inspect_loaded_export(data, descriptor)
+    return normalize_loaded_export(data, descriptor, branch)
+
+
+def normalized_output_filename(source: InputSource) -> str:
+    """根据来源身份生成稳定且适合 Windows 的唯一输出文件名。"""
+
+    if source.kind == "zip_member":
+        member = PurePosixPath((source.member_path or "source.json").replace("\\", "/"))
+        label = f"{source.path.stem}__{'__'.join(member.with_suffix('').parts)}"
+        identity = f"zip_member\0{source.path}\0{source.member_path}"
+    else:
+        label = source.path.stem
+        identity = f"json_file\0{source.path}"
+
+    safe_label = re.sub(r"[^\w.-]+", "_", label, flags=re.UNICODE).strip("._")
+    safe_label = (safe_label or "source")[:96]
+    identity_hash = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:10]
+    return f"{safe_label}--{identity_hash}.normalized.json"
+
+
+def normalize_input(
+    input_path: Path,
+    output_directory: Path,
+    branch: str = "active",
+    limits: InspectionLimits = DEFAULT_INSPECTION_LIMITS,
+) -> dict[str, Any]:
+    """批量标准化受支持来源，并在新目录中写入结果和 manifest。"""
+
+    output_path = output_directory.expanduser().resolve()
+    if output_path.exists():
+        raise ExportError(f"输出目录已存在，拒绝覆盖或追加：{output_path}")
+
+    resolved = resolve_input(input_path, limits)
+    inspections = [inspect_source(source, limits) for source in resolved.sources]
+    supported_count = sum(
+        inspection.get("status") == "supported" for inspection in inspections
+    )
+    if supported_count == 0:
+        raise ExportError("没有通过 inspect 的受支持 JSON 来源，不生成标准化输出")
+
+    output_path.mkdir(parents=True, exist_ok=False)
+    entries: list[dict[str, Any]] = []
+    normalized_source_count = 0
+    skipped_source_count = 0
+    failed_source_count = 0
+    normalized_conversation_count = 0
+    skipped_conversation_count = 0
+    message_count = 0
+
+    for source, inspection in zip(resolved.sources, inspections, strict=True):
+        if inspection.get("status") != "supported":
+            skipped_source_count += 1
+            entries.append(
+                {
+                    "status": "skipped",
+                    "source": inspection.get("source", source_descriptor(source)),
+                    "inspection_status": inspection.get("status"),
+                    "reason": inspection.get("error"),
+                }
+            )
+            continue
+
+        output_name = normalized_output_filename(source)
+        try:
+            result = normalize_source(source, branch, limits, inspection)
+            write_new_json(output_path / output_name, result.document)
+        except (
+            ExportError,
+            FileExistsError,
+            json.JSONDecodeError,
+            UnicodeError,
+            OSError,
+        ) as exc:
+            failed_source_count += 1
+            entries.append(
+                {
+                    "status": "failed",
+                    "source": inspection["source"],
+                    "reason": str(exc),
+                }
+            )
+            continue
+
+        normalization = result.diagnostics
+        normalized_source_count += 1
+        normalized_conversation_count += normalization[
+            "normalized_conversation_count"
+        ]
+        skipped_conversation_count += normalization["skipped_conversation_count"]
+        message_count += normalization["message_count"]
+        entries.append(
+            {
+                "status": "normalized",
+                "source": result.source,
+                "output": output_name,
+                "normalization": normalization,
+            }
+        )
+
+    has_issues = any(
+        (
+            skipped_source_count,
+            failed_source_count,
+            skipped_conversation_count,
+            resolved.warnings,
+            any(archive.get("status") != "ok" for archive in resolved.archives),
+        )
+    )
+    manifest = {
+        "format": MANIFEST_FORMAT_VERSION,
+        "status": "completed_with_issues" if has_issues else "ok",
+        "input": {
+            "path": str(resolved.input_path),
+            "type": resolved.input_type,
+        },
+        "output_directory": str(output_path),
+        "branch_policy": branch,
+        "discovery": {
+            "json_file_count": resolved.json_file_count,
+            "zip_file_count": resolved.zip_file_count,
+            "other_file_count": resolved.other_file_count,
+            "candidate_json_count": len(resolved.sources),
+        },
+        "archives": list(resolved.archives),
+        "summary": {
+            "candidate_source_count": len(resolved.sources),
+            "normalized_source_count": normalized_source_count,
+            "skipped_source_count": skipped_source_count,
+            "failed_source_count": failed_source_count,
+            "normalized_conversation_count": normalized_conversation_count,
+            "skipped_conversation_count": skipped_conversation_count,
+            "message_count": message_count,
+        },
+        "entries": entries,
+        "warnings": list(resolved.warnings),
+    }
+    write_new_json(output_path / "manifest.json", manifest)
+    return manifest
+
+
+def normalization_exit_code(manifest: dict[str, Any]) -> int:
+    """根据批量标准化结果返回适合自动化调用的退出码。"""
+
+    return 0 if manifest.get("status") == "ok" else 1
+
+
 def write_new_json(path: Path, value: Any) -> None:
     """把值写入新的 JSON 文件；目标已存在时拒绝覆盖。"""
 
@@ -888,10 +1115,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     normalize_parser = subparsers.add_parser(
-        "normalize", help="把单个 JSON 中的用户可见消息写入新文件"
+        "normalize", help="把受支持的 JSON、ZIP 或目录标准化到新目录"
     )
-    normalize_parser.add_argument("input", type=Path, help="待标准化的导出 JSON")
-    normalize_parser.add_argument("output", type=Path, help="新建的输出 JSON")
+    normalize_parser.add_argument(
+        "input", type=Path, help="待标准化的 JSON、ZIP 或目录"
+    )
+    normalize_parser.add_argument(
+        "output", type=Path, help="必须尚不存在的新输出目录"
+    )
     normalize_parser.add_argument(
         "--branch",
         choices=("active", "all"),
@@ -915,7 +1146,10 @@ def main(argv: list[str] | None = None) -> int:
         else:
             if args.input.resolve() == args.output.resolve():
                 raise ExportError("输出路径必须与输入路径不同")
-            write_new_json(args.output, normalize_export(args.input, args.branch))
+            manifest = normalize_input(args.input, args.output, args.branch)
+            json.dump(manifest, sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+            return normalization_exit_code(manifest)
     except (ExportError, FileExistsError, json.JSONDecodeError, OSError) as exc:
         parser.exit(2, f"错误：{exc}\n")
     return 0
