@@ -1,0 +1,77 @@
+# JetBrains / 编辑器
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+
+# Python 字节码与缓存
+__pycache__/
+*.py[cod]
+*$py.class
+.python-version
+
+# Python 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+
+# Python 构建与包产物
+build/
+dist/
+*.egg-info/
+.eggs/
+wheels/
+
+# 测试、覆盖率和静态检查缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# 本地环境变量、凭据与配置
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# 私密对话数据与导出包
+data/raw/
+data/normalized/
+exports/
+/conversations.json
+/chat.html
+/user.json
+/message_feedback.json
+/chatgpt-export*.zip
+/export-*.zip
+
+# 生成的数据库与索引
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.db
+*.db-journal
+
+# 日志、临时文件与备份
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+tmp/
+temp/
+
+# 操作系统文件
+.DS_Store
+Thumbs.db
+Desktop.ini
+

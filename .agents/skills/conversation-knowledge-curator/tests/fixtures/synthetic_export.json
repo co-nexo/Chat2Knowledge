@@ -1,0 +1,90 @@
+[
+  {
+    "id": "conv-synthetic-1",
+    "title": "Synthetic branching example",
+    "create_time": 1000,
+    "update_time": 1005,
+    "current_node": "assistant-final",
+    "mapping": {
+      "root": {
+        "id": "root",
+        "parent": null,
+        "children": ["user-1"],
+        "message": null
+      },
+      "user-1": {
+        "id": "user-1",
+        "parent": "root",
+        "children": ["assistant-old", "assistant-reasoning"],
+        "message": {
+          "id": "message-user-1",
+          "author": {"role": "user", "name": null},
+          "create_time": 1001,
+          "content": {"content_type": "text", "parts": ["Visible question"]},
+          "metadata": {},
+          "recipient": "all"
+        }
+      },
+      "assistant-old": {
+        "id": "assistant-old",
+        "parent": "user-1",
+        "children": [],
+        "message": {
+          "id": "message-assistant-old",
+          "author": {"role": "assistant", "name": null},
+          "create_time": 1002,
+          "content": {"content_type": "text", "parts": ["Inactive branch answer"]},
+          "metadata": {},
+          "recipient": "all"
+        }
+      },
+      "assistant-reasoning": {
+        "id": "assistant-reasoning",
+        "parent": "user-1",
+        "children": ["assistant-final"],
+        "message": {
+          "id": "message-assistant-reasoning",
+          "author": {"role": "assistant", "name": null},
+          "create_time": 1003,
+          "content": {"content_type": "thoughts", "parts": ["Hidden reasoning"]},
+          "metadata": {},
+          "channel": "analysis",
+          "recipient": "all"
+        }
+      },
+      "assistant-final": {
+        "id": "assistant-final",
+        "parent": "assistant-reasoning",
+        "children": ["tool-hidden"],
+        "message": {
+          "id": "message-assistant-final",
+          "author": {"role": "assistant", "name": null},
+          "create_time": 1004,
+          "content": {
+            "content_type": "text",
+            "parts": [
+              "Visible answer",
+              {"content_type": "image_asset_pointer", "asset_pointer": "redacted"},
+              {"content_type": "tool_result", "text": "Structured tool text"}
+            ]
+          },
+          "metadata": {},
+          "recipient": "all"
+        }
+      },
+      "tool-hidden": {
+        "id": "tool-hidden",
+        "parent": "assistant-final",
+        "children": [],
+        "message": {
+          "id": "message-tool-hidden",
+          "author": {"role": "tool", "name": "synthetic_tool"},
+          "create_time": 1005,
+          "content": {"content_type": "text", "parts": ["Hidden tool payload"]},
+          "metadata": {}
+        }
+      }
+    }
+  }
+]
+
