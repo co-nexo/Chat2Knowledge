@@ -11,12 +11,15 @@ import argparse
 import hashlib
 import json
 import sys
+import zipfile
 from collections import Counter
-from pathlib import Path
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 
 FORMAT_VERSION = "conversation-knowledge-curator.normalized.v1"
+INSPECTION_FORMAT_VERSION = "conversation-knowledge-curator.inspection.v1"
 ELIGIBLE_ROLES = {"user", "assistant"}
 HIDDEN_CONTENT_TYPES = {
     "analysis",
@@ -34,8 +37,361 @@ HIDDEN_METADATA_FLAGS = {
 VISIBLE_ASSISTANT_RECIPIENTS = {"all", "user"}
 
 
+@dataclass(frozen=True)
+class InspectionLimits:
+    """限制检查阶段允许读取和解压的数据规模。"""
+
+    max_json_bytes: int = 1024 * 1024 * 1024
+    max_archive_json_bytes: int = 4 * 1024 * 1024 * 1024
+    max_archive_members: int = 10_000
+    max_compression_ratio: float = 200.0
+
+
+@dataclass(frozen=True)
+class InputSource:
+    """一个可独立检查的 JSON 来源，可以来自普通文件或 ZIP 成员。"""
+
+    kind: str
+    path: Path
+    size_bytes: int
+    member_path: str | None = None
+    archive_index: int | None = None
+    compressed_size_bytes: int | None = None
+
+
+@dataclass(frozen=True)
+class ResolvedInput:
+    """输入路径解析结果以及发现阶段的统计和警告。"""
+
+    input_path: Path
+    input_type: str
+    sources: tuple[InputSource, ...]
+    archives: tuple[dict[str, Any], ...]
+    json_file_count: int
+    zip_file_count: int
+    other_file_count: int
+    warnings: tuple[str, ...]
+
+
+DEFAULT_INSPECTION_LIMITS = InspectionLimits()
+
+
 class ExportError(ValueError):
     """输入 JSON 不符合受支持的导出容器时抛出。"""
+
+
+class InputSafetyError(ExportError):
+    """输入超过安全限制或包含不安全路径时抛出。"""
+
+
+def archive_member_is_safe(member_name: str) -> bool:
+    """判断 ZIP 成员名是否为安全的相对路径。"""
+
+    normalized = member_name.replace("\\", "/")
+    posix_path = PurePosixPath(normalized)
+    windows_path = PureWindowsPath(member_name)
+    return (
+        bool(normalized)
+        and not posix_path.is_absolute()
+        and not windows_path.is_absolute()
+        and not windows_path.drive
+        and ".." not in posix_path.parts
+    )
+
+
+def compression_ratio(uncompressed_size: int, compressed_size: int) -> float:
+    """计算压缩比；非空内容的压缩大小为零时返回无穷大。"""
+
+    if uncompressed_size == 0:
+        return 0.0
+    if compressed_size == 0:
+        return float("inf")
+    return uncompressed_size / compressed_size
+
+
+def discover_archive_sources(
+    path: Path, limits: InspectionLimits
+) -> tuple[list[InputSource], dict[str, Any], list[str]]:
+    """只读枚举 ZIP 中可安全检查的 JSON 成员。"""
+
+    sources: list[InputSource] = []
+    warnings: list[str] = []
+    report: dict[str, Any] = {
+        "path": str(path),
+        "status": "ok",
+        "member_count": 0,
+        "json_member_count": 0,
+        "candidate_json_count": 0,
+        "ignored_member_count": 0,
+        "skipped_json_count": 0,
+        "json_uncompressed_bytes": 0,
+        "warnings": [],
+    }
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            infos = archive.infolist()
+    except (OSError, zipfile.BadZipFile) as exc:
+        message = f"ZIP 无法读取：{exc}"
+        report.update(status="invalid", error=message)
+        warnings.append(f"{path}：{message}")
+        return sources, report, warnings
+
+    report["member_count"] = len(infos)
+    if len(infos) > limits.max_archive_members:
+        message = (
+            f"ZIP 成员数量 {len(infos)} 超过限制 "
+            f"{limits.max_archive_members}"
+        )
+        report.update(status="rejected", error=message)
+        warnings.append(f"{path}：{message}")
+        return sources, report, warnings
+
+    json_total_bytes = 0
+    for index, info in enumerate(infos):
+        if info.is_dir():
+            continue
+        if Path(info.filename).suffix.lower() != ".json":
+            report["ignored_member_count"] += 1
+            continue
+
+        report["json_member_count"] += 1
+        if not archive_member_is_safe(info.filename):
+            message = f"跳过不安全的 ZIP 成员路径：{info.filename!r}"
+            report["skipped_json_count"] += 1
+            warnings.append(f"{path}：{message}")
+            continue
+        if info.file_size > limits.max_json_bytes:
+            message = (
+                f"跳过过大的 JSON 成员 {info.filename!r}："
+                f"{info.file_size} 字节，限制为 {limits.max_json_bytes} 字节"
+            )
+            report["skipped_json_count"] += 1
+            warnings.append(f"{path}：{message}")
+            continue
+        ratio = compression_ratio(info.file_size, info.compress_size)
+        if ratio > limits.max_compression_ratio:
+            message = (
+                f"跳过压缩比异常的 JSON 成员 {info.filename!r}："
+                f"{ratio:.1f}，限制为 {limits.max_compression_ratio:.1f}"
+            )
+            report["skipped_json_count"] += 1
+            warnings.append(f"{path}：{message}")
+            continue
+
+        json_total_bytes += info.file_size
+        sources.append(
+            InputSource(
+                kind="zip_member",
+                path=path,
+                size_bytes=info.file_size,
+                member_path=info.filename,
+                archive_index=index,
+                compressed_size_bytes=info.compress_size,
+            )
+        )
+
+    report["json_uncompressed_bytes"] = json_total_bytes
+    if json_total_bytes > limits.max_archive_json_bytes:
+        message = (
+            f"ZIP 中候选 JSON 的总解压大小 {json_total_bytes} 字节超过限制 "
+            f"{limits.max_archive_json_bytes} 字节"
+        )
+        report.update(status="rejected", error=message)
+        warnings.append(f"{path}：{message}")
+        sources.clear()
+    elif report["json_member_count"] == 0:
+        message = "ZIP 中未发现 JSON 文件"
+        warnings.append(f"{path}：{message}")
+    elif not sources:
+        report["status"] = "rejected"
+        report["error"] = "ZIP 中没有通过安全检查的 JSON 成员"
+
+    report["candidate_json_count"] = len(sources)
+    report["warnings"] = [
+        warning.removeprefix(f"{path}：")
+        for warning in warnings
+        if warning.startswith(f"{path}：")
+    ]
+    return sources, report, warnings
+
+
+def resolve_input(
+    input_path: Path, limits: InspectionLimits = DEFAULT_INSPECTION_LIMITS
+) -> ResolvedInput:
+    """把文件、目录或 ZIP 输入解析为确定顺序的 JSON 来源。"""
+
+    path = input_path.expanduser().resolve()
+    if not path.exists():
+        raise ExportError(f"输入路径不存在：{path}")
+
+    sources: list[InputSource] = []
+    archives: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    json_file_count = 0
+    zip_file_count = 0
+    other_file_count = 0
+
+    if path.is_file():
+        suffix = path.suffix.lower()
+        if suffix == ".json":
+            sources.append(
+                InputSource(
+                    kind="json_file",
+                    path=path,
+                    size_bytes=path.stat().st_size,
+                )
+            )
+            json_file_count = 1
+            input_type = "json_file"
+        elif suffix == ".zip":
+            archive_sources, archive_report, archive_warnings = (
+                discover_archive_sources(path, limits)
+            )
+            sources.extend(archive_sources)
+            archives.append(archive_report)
+            warnings.extend(archive_warnings)
+            zip_file_count = 1
+            input_type = "zip_archive"
+        else:
+            raise ExportError(
+                f"不支持的输入文件类型 {suffix or '<无扩展名>'}；"
+                "只支持 .json 和 .zip"
+            )
+    elif path.is_dir():
+        input_type = "directory"
+        try:
+            entries = sorted(
+                path.rglob("*"),
+                key=lambda entry: entry.relative_to(path).as_posix().casefold(),
+            )
+        except OSError as exc:
+            raise ExportError(f"无法扫描输入目录 {path}：{exc}") from exc
+
+        for entry in entries:
+            if entry.is_symlink():
+                warnings.append(f"跳过符号链接：{entry}")
+                continue
+            try:
+                if not entry.is_file():
+                    continue
+                suffix = entry.suffix.lower()
+                if suffix == ".json":
+                    sources.append(
+                        InputSource(
+                            kind="json_file",
+                            path=entry,
+                            size_bytes=entry.stat().st_size,
+                        )
+                    )
+                    json_file_count += 1
+                elif suffix == ".zip":
+                    archive_sources, archive_report, archive_warnings = (
+                        discover_archive_sources(entry, limits)
+                    )
+                    sources.extend(archive_sources)
+                    archives.append(archive_report)
+                    warnings.extend(archive_warnings)
+                    zip_file_count += 1
+                else:
+                    other_file_count += 1
+            except OSError as exc:
+                warnings.append(f"无法检查文件 {entry}：{exc}")
+    else:
+        raise ExportError(f"输入路径既不是普通文件也不是目录：{path}")
+
+    return ResolvedInput(
+        input_path=path,
+        input_type=input_type,
+        sources=tuple(sources),
+        archives=tuple(archives),
+        json_file_count=json_file_count,
+        zip_file_count=zip_file_count,
+        other_file_count=other_file_count,
+        warnings=tuple(warnings),
+    )
+
+
+def read_input_source(
+    source: InputSource, limits: InspectionLimits = DEFAULT_INSPECTION_LIMITS
+) -> bytes:
+    """读取一个已发现的 JSON 来源，不把 ZIP 成员解压到磁盘。"""
+
+    if source.size_bytes > limits.max_json_bytes:
+        raise InputSafetyError(
+            f"JSON 大小 {source.size_bytes} 字节超过限制 "
+            f"{limits.max_json_bytes} 字节"
+        )
+
+    if source.kind == "json_file":
+        payload = source.path.read_bytes()
+    elif source.kind == "zip_member":
+        if source.archive_index is None or source.member_path is None:
+            raise ExportError("ZIP 来源缺少成员索引或成员路径")
+        try:
+            with zipfile.ZipFile(source.path) as archive:
+                infos = archive.infolist()
+                if source.archive_index >= len(infos):
+                    raise ExportError("ZIP 内容已变化，成员索引不再有效")
+                info = infos[source.archive_index]
+                if info.filename != source.member_path:
+                    raise ExportError("ZIP 内容已变化，成员路径不再匹配")
+                with archive.open(info) as handle:
+                    payload = handle.read(limits.max_json_bytes + 1)
+        except zipfile.BadZipFile as exc:
+            raise ExportError(f"ZIP 无法读取：{exc}") from exc
+    else:
+        raise ExportError(f"未知输入来源类型：{source.kind}")
+
+    if len(payload) > limits.max_json_bytes:
+        raise InputSafetyError(
+            f"JSON 实际读取大小超过限制 {limits.max_json_bytes} 字节"
+        )
+    if len(payload) != source.size_bytes:
+        raise ExportError("输入在发现与读取之间发生变化，请重新执行 inspect")
+    return payload
+
+
+def source_descriptor(
+    source: InputSource, content_sha256: str | None = None
+) -> dict[str, Any]:
+    """生成不包含内容正文的来源描述。"""
+
+    descriptor: dict[str, Any] = {
+        "kind": source.kind,
+        "size_bytes": source.size_bytes,
+    }
+    if source.kind == "json_file":
+        descriptor["path"] = str(source.path)
+    else:
+        descriptor.update(
+            archive_path=str(source.path),
+            member_path=source.member_path,
+            compressed_size_bytes=source.compressed_size_bytes,
+        )
+    if content_sha256 is not None:
+        descriptor["sha256"] = content_sha256
+    return descriptor
+
+
+def sha256_bytes(payload: bytes) -> str:
+    """计算内存数据的 SHA-256。"""
+
+    return hashlib.sha256(payload).hexdigest()
+
+
+def json_shape(data: Any) -> dict[str, Any]:
+    """描述 JSON 顶层结构，不包含任何值或消息正文。"""
+
+    if isinstance(data, dict):
+        return {
+            "top_level_type": "object",
+            "top_level_keys": sorted(str(key) for key in data),
+            "top_level_size": len(data),
+        }
+    if isinstance(data, list):
+        return {"top_level_type": "array", "top_level_size": len(data)}
+    return {"top_level_type": type(data).__name__, "top_level_size": None}
 
 
 def load_json(path: Path) -> Any:
@@ -337,10 +693,11 @@ def normalize_export(path: Path, branch: str = "active") -> dict[str, Any]:
     }
 
 
-def inspect_export(path: Path) -> dict[str, Any]:
-    """生成不包含消息正文的导出结构检查报告。"""
+def inspect_loaded_export(
+    data: Any, source: dict[str, Any]
+) -> dict[str, Any]:
+    """检查已加载的导出数据，并生成不包含消息正文的结构报告。"""
 
-    data = load_json(path)
     conversations, envelope = conversation_objects(data)
     roles: Counter[str] = Counter()
     content_types: Counter[str] = Counter()
@@ -389,7 +746,7 @@ def inspect_export(path: Path) -> dict[str, Any]:
             exclusions[reason or "included"] += 1
 
     return {
-        "source": {"path": str(path.resolve()), "sha256": sha256_file(path)},
+        "source": source,
         "container": envelope,
         "conversation_count": len(conversations),
         "conversation_keys": dict(sorted(conversation_keys.items())),
@@ -401,6 +758,108 @@ def inspect_export(path: Path) -> dict[str, Any]:
         "visibility": dict(sorted(exclusions.items())),
         "warnings": warnings,
     }
+
+
+def inspect_export(path: Path) -> dict[str, Any]:
+    """兼容旧调用方式，检查单个 JSON 文件。"""
+
+    resolved_path = path.expanduser().resolve()
+    data = load_json(resolved_path)
+    source = {
+        "kind": "json_file",
+        "path": str(resolved_path),
+        "size_bytes": resolved_path.stat().st_size,
+        "sha256": sha256_file(resolved_path),
+    }
+    return inspect_loaded_export(data, source)
+
+
+def inspect_source(
+    source: InputSource,
+    limits: InspectionLimits = DEFAULT_INSPECTION_LIMITS,
+) -> dict[str, Any]:
+    """检查单个 JSON 来源，并把可恢复错误转换为报告项。"""
+
+    descriptor = source_descriptor(source)
+    try:
+        payload = read_input_source(source, limits)
+    except InputSafetyError as exc:
+        return {"status": "rejected", "source": descriptor, "error": str(exc)}
+    except (ExportError, OSError, RuntimeError) as exc:
+        return {"status": "read_error", "source": descriptor, "error": str(exc)}
+
+    descriptor = source_descriptor(source, sha256_bytes(payload))
+    try:
+        data = json.loads(payload.decode("utf-8-sig"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        return {"status": "invalid_json", "source": descriptor, "error": str(exc)}
+
+    shape = json_shape(data)
+    try:
+        report = inspect_loaded_export(data, descriptor)
+    except ExportError as exc:
+        return {
+            "status": "unsupported",
+            "source": descriptor,
+            "json": shape,
+            "error": str(exc),
+        }
+    return {"status": "supported", "json": shape, **report}
+
+
+def inspect_input(
+    input_path: Path,
+    limits: InspectionLimits = DEFAULT_INSPECTION_LIMITS,
+) -> dict[str, Any]:
+    """统一检查 JSON 文件、ZIP 压缩包或包含这些文件的目录。"""
+
+    resolved = resolve_input(input_path, limits)
+    items = [inspect_source(source, limits) for source in resolved.sources]
+    status_counts = Counter(item["status"] for item in items)
+    archive_issue_count = sum(
+        archive.get("status") != "ok" for archive in resolved.archives
+    )
+    warning_item_count = sum(bool(item.get("warnings")) for item in items)
+    issue_count = (
+        sum(count for status, count in status_counts.items() if status != "supported")
+        + archive_issue_count
+    )
+    if not items:
+        issue_count += 1
+
+    return {
+        "format": INSPECTION_FORMAT_VERSION,
+        "status": "ok" if issue_count == 0 else "issues_found",
+        "input": {
+            "path": str(resolved.input_path),
+            "type": resolved.input_type,
+        },
+        "discovery": {
+            "json_file_count": resolved.json_file_count,
+            "zip_file_count": resolved.zip_file_count,
+            "other_file_count": resolved.other_file_count,
+            "candidate_json_count": len(resolved.sources),
+        },
+        "archives": list(resolved.archives),
+        "items": items,
+        "summary": {
+            "candidate_count": len(items),
+            "supported_count": status_counts.get("supported", 0),
+            "unsupported_count": status_counts.get("unsupported", 0),
+            "invalid_json_count": status_counts.get("invalid_json", 0),
+            "rejected_count": status_counts.get("rejected", 0),
+            "read_error_count": status_counts.get("read_error", 0),
+            "archive_issue_count": archive_issue_count,
+            "warning_item_count": warning_item_count,
+        },
+        "warnings": list(resolved.warnings),
+    }
+
+
+def inspection_exit_code(report: dict[str, Any]) -> int:
+    """根据检查结果返回适合自动化调用的退出码。"""
+
+    return 0 if report.get("status") == "ok" else 1
 
 
 def write_new_json(path: Path, value: Any) -> None:
@@ -420,12 +879,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     inspect_parser = subparsers.add_parser(
-        "inspect", help="输出不包含消息正文的结构报告"
+        "inspect", help="检查 JSON、ZIP 或目录并输出结构报告"
     )
-    inspect_parser.add_argument("input", type=Path, help="待检查的导出 JSON")
+    inspect_parser.add_argument(
+        "input",
+        type=Path,
+        help="待检查的 JSON 文件、ZIP 压缩包或目录",
+    )
 
     normalize_parser = subparsers.add_parser(
-        "normalize", help="把用户可见消息写入新的标准化 JSON"
+        "normalize", help="把单个 JSON 中的用户可见消息写入新文件"
     )
     normalize_parser.add_argument("input", type=Path, help="待标准化的导出 JSON")
     normalize_parser.add_argument("output", type=Path, help="新建的输出 JSON")
@@ -445,8 +908,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "inspect":
-            json.dump(inspect_export(args.input), sys.stdout, ensure_ascii=False, indent=2)
+            report = inspect_input(args.input)
+            json.dump(report, sys.stdout, ensure_ascii=False, indent=2)
             sys.stdout.write("\n")
+            return inspection_exit_code(report)
         else:
             if args.input.resolve() == args.output.resolve():
                 raise ExportError("输出路径必须与输入路径不同")

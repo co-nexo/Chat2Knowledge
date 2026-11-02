@@ -46,6 +46,7 @@ htmlcov/
 data/raw/
 data/normalized/
 exports/
+/imports/
 /conversations.json
 /chat.html
 /user.json

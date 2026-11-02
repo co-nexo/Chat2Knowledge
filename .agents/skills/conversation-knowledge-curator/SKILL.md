@@ -17,10 +17,10 @@ description: 将 ChatGPT 对话导出 JSON 整理为可审核的知识候选。�
 
 ## 工作流程
 
-1. 找到原始 JSON，并在标准化之前检查其结构。如果仓库中已有真实样本，应使用样本确认字段，不得凭记忆扩展解析器。
-2. 当输入结构陌生、解析失败或字段含义需要判断时，读取 [references/chatgpt-export-json.md](references/chatgpt-export-json.md)。
-3. 运行 `scripts/chatgpt_export.py inspect <input.json>`，检查结构报告和警告。检查报告不得回显消息正文。
-4. 运行 `scripts/chatgpt_export.py normalize <input.json> <new-output.json>`。当 `current_node` 有效时，默认只选择当前活动分支；只有任务明确需要全部分支时才使用 `--branch all`。
+1. 确定待处理的输入路径。输入可以是单个 JSON 文件、ZIP 压缩包，或包含多个 JSON/ZIP 的目录。不要自行扫描无关的项目目录。
+2. 先运行 `scripts/chatgpt_export.py inspect <input-path>`。由程序统一检查路径、识别输入类型、确定性发现候选 JSON、检查 JSON 语法与顶层容器，并检查 ChatGPT 对话结构。检查报告不得回显消息正文。
+3. 根据 inspect 报告判断输入是否受支持。只有出现不支持的容器、解析警告或字段含义不明确时，才读取 [references/chatgpt-export-json.md](references/chatgpt-export-json.md)。不得凭记忆猜测字段含义；无法确认的来源暂停标准化。
+4. 当前 `normalize` 只接受已经确认受支持的单个 JSON 文件：运行 `scripts/chatgpt_export.py normalize <input.json> <new-output.json>`。当 `current_node` 有效时，默认只选择当前活动分支；只有任务明确需要全部分支时才使用 `--branch all`。目录和 ZIP 的批量标准化属于后续增量，不得通过不安全的全量解压绕过该边界。
 5. 标准化输出必须通过源文件路径和 SHA-256 保持可追溯。不得静默丢弃解析器警告。
 6. 在后续语义阶段判断对话价值、提取原子知识候选、分类，并与现有 Markdown 文档匹配。每个候选必须引用来源对话 ID 和消息 ID。
 7. 将新增、融合和冲突建议整理为审核包，并附带 Markdown diff。明确标记不确定陈述、时效性事实和冲突。
@@ -28,11 +28,11 @@ description: 将 ChatGPT 对话导出 JSON 整理为可审核的知识候选。�
 
 ## 输入与输出
 
-采集输入可以是包含单个对话对象的 JSON、对话对象列表，或带有 `conversations` 列表的包装对象。对话通常需要包含 `mapping` 对象才能生成消息。
+`inspect` 接受单个 JSON 文件、ZIP 压缩包或目录。目录会递归发现 `.json` 和 `.zip`；ZIP 使用标准库在内存中读取候选 JSON，不会写入或覆盖磁盘文件。被检查的 JSON 可以是单个对话对象、对话对象列表，或带有 `conversations` 列表的包装对象。对话通常需要包含 `mapping` 对象才能生成消息。
 
 当前工具输出：
 
-- 检查报告：包含结构、数量、实际观察到的角色和内容类型、排除原因及警告；
+- `conversation-knowledge-curator.inspection.v1` 检查报告：包含输入类型、候选来源、ZIP 统计、JSON 顶层结构、对话数量、实际观察到的角色和内容类型、排除原因及警告；
 - `conversation-knowledge-curator.normalized.v1` 格式的标准化 JSON：包含来源信息、选中的用户可见消息和警告。
 
 后续知识处理结果应保持为相互独立的产物，包括提取候选、文档匹配、冲突说明和 patch/diff。所有生成结果在获得批准前都只是建议。
