@@ -17,13 +17,14 @@ Knowledge proposals 连接第三阶段知识候选与正式 Markdown。Codex 负
   "format": "conversation-knowledge-curator.knowledge-proposals.v1",
   "inputs": {
     "knowledge_candidates_sha256": "hex",
-    "knowledge_inventory_sha256": "hex"
+    "knowledge_inventory_sha256": "hex",
+    "knowledge_retrieval_sha256": "hex"
   },
   "proposals": []
 }
 ```
 
-输入哈希绑定本次判断所使用的候选和知识库快照。任一输入变化时必须重新校验并重新生成审核包。
+输入哈希绑定本次判断所使用的候选、知识库快照和召回结果。任一输入变化时必须重新校验并重新生成审核包。召回结果只提供阅读范围，Codex仍需读取候选和必要的 Markdown 原文后才能作出 action 判断。
 
 ## Proposal
 
