@@ -66,7 +66,7 @@ Evidence 只能证明候选从何处提取，不能单独证明候选代表的�
 - `time_sensitive`
 - `sensitive`
 
-`assistant_only` 由 Python 根据所有证据消息的角色重新计算；语义草稿中的同名标记不会被直接信任。其他标记由 Codex 初步识别并由 Python校验枚举值。
+`assistant_only` 由 Python 根据所有证据消息的角色重新计算；语义草稿中的同名标记不会被直接信任。其他标记由 Codex 初步识别并由 Python 校验枚举值。
 
 ## 精确去重
 
