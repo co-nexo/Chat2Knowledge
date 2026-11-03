@@ -11,8 +11,6 @@
 7. 校验失败时不创建输出目录；成功时生成候选和提取 manifest。
 8. 已存在输出目录时拒绝覆盖，manifest 不包含消息正文。
 
-本文件验证结构、来源引用和确定性处理，不验证候选事实是否正确，
-也不评价 Codex 是否准确理解了对话语义。
 """
 
 from __future__ import annotations
@@ -23,7 +21,6 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = SKILL_DIR.parents[2]

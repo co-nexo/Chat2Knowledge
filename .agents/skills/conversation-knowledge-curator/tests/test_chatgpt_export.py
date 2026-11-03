@@ -17,13 +17,12 @@
 6. 批量处理 JSON、ZIP 和目录，生成逐来源文件及 manifest。
 7. CLI 返回结构化结果，并拒绝覆盖、追加或使用相同输入输出路径。
 
-本文件不判断对话是否具有知识价值，也不测试知识候选的语义质量。
 """
 
 from __future__ import annotations
 
-import copy
 import contextlib
+import copy
 import importlib.util
 import io
 import json
@@ -32,7 +31,6 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
-
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 WORKSPACE_ROOT = SKILL_DIR.parents[2]
