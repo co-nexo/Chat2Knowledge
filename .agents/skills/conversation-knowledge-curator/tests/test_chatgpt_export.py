@@ -1,5 +1,28 @@
+"""ChatGPT 导出检查与标准化测试。
+
+已覆盖的检查行为：
+
+1. inspect 报告结构统计，但不泄露消息正文和隐藏内容。
+2. 识别单个 JSON、目录和 ZIP，并在目录中继续处理其他有效来源。
+3. 在内存中检查 ZIP，拒绝不安全成员，记录损坏压缩包问题。
+4. 拒绝不存在的路径、不支持的文件类型和不支持的 JSON 容器。
+
+已覆盖的标准化行为：
+
+1. 默认只保留活动分支，也支持显式遍历全部可见分支。
+2. 排除 hidden reasoning、工具载荷和其他非用户可见内容。
+3. 活动分支不可确认时跳过对话，并在诊断信息中记录原因。
+4. 为缺失或重复的 conversation/message ID 生成稳定唯一替代值。
+5. 只标准化 inspect 确认支持的来源。
+6. 批量处理 JSON、ZIP 和目录，生成逐来源文件及 manifest。
+7. CLI 返回结构化结果，并拒绝覆盖、追加或使用相同输入输出路径。
+
+本文件不判断对话是否具有知识价值，也不测试知识候选的语义质量。
+"""
+
 from __future__ import annotations
 
+import copy
 import contextlib
 import importlib.util
 import io
@@ -134,7 +157,7 @@ class NormalizeExportTests(unittest.TestCase):
         messages = result["conversations"][0]["messages"]
 
         self.assertEqual(
-            result["format"], "conversation-knowledge-curator.normalized.v2"
+            result["format"], "conversation-knowledge-curator.normalized.v3"
         )
         self.assertEqual(
             set(result), {"format", "source_sha256", "conversations"}
@@ -196,6 +219,50 @@ class NormalizeExportTests(unittest.TestCase):
             result.diagnostics["skipped_conversations"][0]["reason_code"],
             "active_branch_unavailable",
         )
+
+    def test_missing_conversation_id_gets_stable_synthetic_id(self) -> None:
+        data = chatgpt_export.load_json(FIXTURE_PATH)
+        data[0].pop("id", None)
+        data[0].pop("conversation_id", None)
+        source = {
+            "kind": "json_file",
+            "path": str(FIXTURE_PATH),
+            "size_bytes": FIXTURE_PATH.stat().st_size,
+            "sha256": chatgpt_export.sha256_file(FIXTURE_PATH),
+        }
+
+        first = chatgpt_export.normalize_loaded_export(data, source, "active")
+        second = chatgpt_export.normalize_loaded_export(data, source, "active")
+        first_id = first.document["conversations"][0]["conversation_id"]
+        second_id = second.document["conversations"][0]["conversation_id"]
+
+        self.assertEqual(first_id, second_id)
+        self.assertTrue(first_id.startswith("synthetic-conversation-"))
+
+    def test_duplicate_ids_get_stable_unique_replacements(self) -> None:
+        data = chatgpt_export.load_json(FIXTURE_PATH)
+        duplicate = copy.deepcopy(data[0])
+        data.append(duplicate)
+        visible_nodes = ["user-1", "assistant-final"]
+        for node_id in visible_nodes:
+            data[0]["mapping"][node_id]["message"]["id"] = "duplicate"
+        source = {
+            "kind": "json_file",
+            "path": str(FIXTURE_PATH),
+            "size_bytes": FIXTURE_PATH.stat().st_size,
+            "sha256": chatgpt_export.sha256_file(FIXTURE_PATH),
+        }
+
+        result = chatgpt_export.normalize_loaded_export(data, source, "active")
+        conversations = result.document["conversations"]
+        conversation_ids = [item["conversation_id"] for item in conversations]
+        message_ids = [
+            message["message_id"] for message in conversations[0]["messages"]
+        ]
+
+        self.assertEqual(len(conversation_ids), len(set(conversation_ids)))
+        self.assertEqual(len(message_ids), len(set(message_ids)))
+        self.assertTrue(result.diagnostics["warnings"])
 
     def test_normalize_source_rejects_unsupported_inspection(self) -> None:
         with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:

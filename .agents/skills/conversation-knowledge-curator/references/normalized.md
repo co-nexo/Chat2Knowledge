@@ -1,14 +1,24 @@
-# `normalized.v2` 格式契约
+# normalized 格式契约
 
-本文档定义 `conversation-knowledge-curator.normalized.v2` 的正式结构。该文件是供后续知识提取使用的精简内容载体，不承担批次审计职责。来源详情、处理统计、跳过原因和警告统一记录在同一输出目录的 `manifest.json` 中。
+当前格式版本：`conversation-knowledge-curator.normalized.v3`
 
-`normalized.v2` 是对既有 `normalized.v1` 的不兼容升级。读取方必须按 `format` 选择解析逻辑，不得把 v1 和 v2 视为相同结构。修改字段含义、必需性或安全语义时，必须同步更新实现和测试；后续不兼容变更必须再次升级格式版本。
+本文档定义当前 normalized 格式的正式结构。该文件是供后续知识提取使用的精简内容载体，不承担批次审计职责。来源详情、处理统计、跳过原因和警告统一记录在同一输出目录的 `manifest.json` 中。
+
+`normalized.v3` 在 v2 精简内容结构的基础上，进一步保证每段成功标准化的对话都有稳定、非空的 `conversation_id`，供第三阶段可靠引用。这是对允许空对话 ID 的 v2 契约的不兼容升级。读取方必须按 `format` 选择解析逻辑；后续不兼容变更必须再次升级格式版本。
+
+## 版本兼容性
+
+| 版本 | 状态 | 主要差异 |
+|---|---|---|
+| v3 | 当前版本 | 保证对话和消息 ID 稳定、非空且唯一 |
+| v2 | 不再生成 | `conversation_id` 允许为空 |
+| v1 | 不再支持 | 内容、来源和诊断字段尚未分离 |
 
 ## 顶层结构
 
 ```json
 {
-  "format": "conversation-knowledge-curator.normalized.v2",
+  "format": "conversation-knowledge-curator.normalized.v3",
   "source_sha256": "hex",
   "conversations": []
 }
@@ -25,7 +35,7 @@
 ```json
 {
   "source_index": 0,
-  "conversation_id": "id-or-null",
+  "conversation_id": "conversation-id",
   "title": "title-or-null",
   "create_time": 0,
   "update_time": 0,
@@ -34,7 +44,8 @@
 ```
 
 - `source_index`：必需，对话在原始容器中的零基索引。
-- `conversation_id`、`title` 和时间字段允许为 `null`；时间值保持原样，不解释单位。
+- `conversation_id`：必需、非空且在同一来源内唯一。优先保留原始 ID；原始字段缺失或重复时，根据 `source_sha256`、`source_index` 和必要的冲突序号生成稳定的 `synthetic-conversation-<hash>`。
+- `title` 和时间字段允许为 `null`；时间值保持原样，不解释单位。
 - `messages`：必需，按选定活动路径或确定性的全树遍历顺序排列。
 - 分支策略不在每个对话内重复记录，由 manifest 顶层和 entry 中的诊断信息说明。
 
@@ -49,7 +60,7 @@
 }
 ```
 
-- `message_id`：必需。原始消息 ID 缺失时使用所在节点 ID。
+- `message_id`：必需且在所属对话内唯一。优先保留原始消息 ID；缺失时使用节点 ID，仍然冲突时生成稳定的 `synthetic-message-<hash>`。
 - `role`：必需，只能是 `user` 或 `assistant`。
 - `create_time`：必需，但允许为 `null`；原值保持不变。
 - `text`：必需，必须是非空字符串。
@@ -65,12 +76,14 @@
 - 来源、成功、跳过对话及消息数量；
 - 跳过原因和标准化警告。
 
-`source_sha256` 必须等于对应 normalized entry 的 `source.sha256`。关系和诊断结构见 [normalization-manifest-v1.md](normalization-manifest-v1.md)。
+`source_sha256` 必须等于对应 normalized entry 的 `source.sha256`。关系和诊断结构见 [normalization-manifest.md](normalization-manifest.md)。
 
 ## 不变量
 
 - 原始输入保持只读。
 - 顶层只能包含 `format`、`source_sha256` 和 `conversations`。
+- 每段成功标准化的对话都有稳定、非空且在来源内唯一的 `conversation_id`。
+- 每条保留消息都有稳定、非空且在对话内唯一的 `message_id`。
 - 标准化文件不得包含原始路径、ZIP 路径、警告、统计或跳过记录。
 - 只保留用户可见的 `user` 和 `assistant` 非空文本。
 - 输出文件不得静默覆盖已有文件。

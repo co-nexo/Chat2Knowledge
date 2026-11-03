@@ -19,7 +19,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 
-FORMAT_VERSION = "conversation-knowledge-curator.normalized.v2"
+FORMAT_VERSION = "conversation-knowledge-curator.normalized.v3"
 INSPECTION_FORMAT_VERSION = "conversation-knowledge-curator.inspection.v1"
 MANIFEST_FORMAT_VERSION = "conversation-knowledge-curator.manifest.v1"
 ELIGIBLE_ROLES = {"user", "assistant"}
@@ -618,8 +618,59 @@ def selected_nodes(
     return mapping, node_ids, warnings, None
 
 
+def synthetic_conversation_id(
+    source_sha256: str,
+    source_index: int,
+    nonce: int = 0,
+) -> str:
+    """根据来源、索引和冲突序号生成稳定的合成对话 ID。"""
+
+    identity = f"{source_sha256}\0{source_index}\0{nonce}".encode("utf-8")
+    suffix = hashlib.sha256(identity).hexdigest()[:20]
+    return f"synthetic-conversation-{suffix}"
+
+
+def stable_conversation_id(
+    conversation: dict[str, Any],
+    source_sha256: str,
+    source_index: int,
+) -> str:
+    """返回原始对话 ID，缺失时根据来源和索引生成稳定 ID。"""
+
+    original_id = conversation.get("id") or conversation.get("conversation_id")
+    if isinstance(original_id, str) and original_id.strip():
+        return original_id
+    if not source_sha256:
+        raise ExportError("生成合成 conversation_id 时缺少来源 SHA-256")
+    return synthetic_conversation_id(source_sha256, source_index)
+
+
+def stable_message_id(
+    message: dict[str, Any],
+    node_id: str,
+    source_sha256: str,
+    source_index: int,
+    used_ids: set[str],
+) -> str:
+    """保留有效消息 ID，并在缺失或重复时生成稳定替代值。"""
+
+    original_id = message.get("id")
+    if isinstance(original_id, str) and original_id.strip():
+        candidate = original_id
+    else:
+        candidate = node_id
+    if candidate and candidate not in used_ids:
+        return candidate
+    identity = f"{source_sha256}\0{source_index}\0{node_id}".encode("utf-8")
+    suffix = hashlib.sha256(identity).hexdigest()[:20]
+    return f"synthetic-message-{suffix}"
+
+
 def normalize_conversation(
-    conversation: dict[str, Any], branch: str, source_index: int = 0
+    conversation: dict[str, Any],
+    branch: str,
+    source_index: int = 0,
+    source_sha256: str = "",
 ) -> tuple[dict[str, Any] | None, list[str], str | None]:
     """把一个对话标准化为用户可见消息列表。"""
 
@@ -628,6 +679,7 @@ def normalize_conversation(
         return None, warnings, skip_reason
 
     messages: list[dict[str, Any]] = []
+    used_message_ids: set[str] = set()
     for node_id in node_ids:
         node = mapping.get(node_id)
         message = message_for_node(node)
@@ -638,9 +690,17 @@ def normalize_conversation(
             continue
         author = message.get("author")
         assert isinstance(author, dict)  # exclusion_reason 已确认作者结构有效
+        message_id = stable_message_id(
+            message,
+            node_id,
+            source_sha256,
+            source_index,
+            used_message_ids,
+        )
+        used_message_ids.add(message_id)
         messages.append(
             {
-                "message_id": message.get("id") or node_id,
+                "message_id": message_id,
                 "role": lower_string(author.get("role")),
                 "create_time": message.get("create_time"),
                 "text": text,
@@ -650,8 +710,10 @@ def normalize_conversation(
     return (
         {
             "source_index": source_index,
-            "conversation_id": (
-                conversation.get("id") or conversation.get("conversation_id")
+            "conversation_id": stable_conversation_id(
+                conversation,
+                source_sha256,
+                source_index,
             ),
             "title": (
                 conversation.get("title")
@@ -692,11 +754,31 @@ def normalize_loaded_export(
     normalized: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     warnings: list[dict[str, Any]] = []
+    used_conversation_ids: set[str] = set()
     for index, conversation in enumerate(conversations):
         item, item_warnings, skip_reason = normalize_conversation(
-            conversation, branch, source_index=index
+            conversation,
+            branch,
+            source_index=index,
+            source_sha256=source_sha256,
         )
         if item is not None:
+            conversation_id = item["conversation_id"]
+            if conversation_id in used_conversation_ids:
+                nonce = 0
+                conversation_id = synthetic_conversation_id(
+                    source_sha256, index, nonce
+                )
+                while conversation_id in used_conversation_ids:
+                    nonce += 1
+                    conversation_id = synthetic_conversation_id(
+                        source_sha256, index, nonce
+                    )
+                item["conversation_id"] = conversation_id
+                item_warnings.append(
+                    "原始 conversation_id 重复；已生成稳定替代 ID"
+                )
+            used_conversation_ids.add(conversation_id)
             normalized.append(item)
         else:
             skipped.append(
@@ -991,6 +1073,7 @@ def normalize_input(
     normalized_conversation_count = 0
     skipped_conversation_count = 0
     message_count = 0
+    normalization_warning_count = 0
 
     for source, inspection in zip(resolved.sources, inspections, strict=True):
         if inspection.get("status") != "supported":
@@ -1033,6 +1116,7 @@ def normalize_input(
         ]
         skipped_conversation_count += normalization["skipped_conversation_count"]
         message_count += normalization["message_count"]
+        normalization_warning_count += len(normalization["warnings"])
         entries.append(
             {
                 "status": "normalized",
@@ -1047,6 +1131,7 @@ def normalize_input(
             skipped_source_count,
             failed_source_count,
             skipped_conversation_count,
+            normalization_warning_count,
             resolved.warnings,
             any(archive.get("status") != "ok" for archive in resolved.archives),
         )
@@ -1075,6 +1160,7 @@ def normalize_input(
             "normalized_conversation_count": normalized_conversation_count,
             "skipped_conversation_count": skipped_conversation_count,
             "message_count": message_count,
+            "normalization_warning_count": normalization_warning_count,
         },
         "entries": entries,
         "warnings": list(resolved.warnings),

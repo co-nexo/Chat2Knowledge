@@ -1,6 +1,14 @@
-# `manifest.v1` 格式契约
+# normalization manifest 格式契约
 
-`conversation-knowledge-curator.manifest.v1` 是一次批量标准化的审计清单，记录输入来源、`normalized.v2` 输出文件、处理状态和诊断信息。输出目录必须是新目录，manifest 固定写入其中的 `manifest.json`。
+当前格式版本：`conversation-knowledge-curator.manifest.v1`
+
+`conversation-knowledge-curator.manifest.v1` 是一次批量标准化的审计清单，记录输入来源、`normalized.v3` 输出文件、处理状态和诊断信息。输出目录必须是新目录，manifest 固定写入其中的 `manifest.json`。
+
+## 版本兼容性
+
+| 版本 | 状态 | 主要差异 |
+|---|---|---|
+| v1 | 当前版本 | 记录批量标准化来源、诊断和输出映射 |
 
 ## 顶层结构
 
@@ -108,7 +116,8 @@
 
 - `normalized_source_count + skipped_source_count + failed_source_count` 等于 `candidate_source_count`。
 - 顶层对话和消息统计等于所有 normalized entry 的 `normalization` 统计之和。
+- `normalization_warning_count` 等于所有 normalized entry 中标准化警告的数量之和。
 - 每个 normalized entry 的 `normalized_conversation_count + skipped_conversation_count` 等于 `source_conversation_count`。
 - 每个 normalized entry 的 `message_count` 等于对应内容文件全部消息数量之和。
-- 任一来源被跳过、失败，任一对话被跳过，或发现阶段存在归档问题时，顶层状态应为 `completed_with_issues`。
+- 任一来源被跳过、失败，任一对话被跳过，出现标准化警告，或发现阶段存在归档问题时，顶层状态应为 `completed_with_issues`。
 - manifest 不包含消息正文。
