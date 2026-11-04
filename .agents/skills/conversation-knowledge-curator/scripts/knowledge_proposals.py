@@ -456,6 +456,72 @@ def build_proposals(
     }
 
 
+def validate_final_proposals(
+    proposals_document: dict[str, object],
+    candidates_document: dict[str, object],
+    candidates_sha256: str,
+    inventory_document: dict[str, object],
+    inventory_sha256: str,
+    retrieval_document: dict[str, object],
+    retrieval_sha256: str,
+    knowledge_root: Path,
+) -> list[dict[str, object]]:
+    """把最终提案还原为草稿重算，拒绝任何非确定性改动。"""
+
+    require_exact_fields(
+        proposals_document,
+        {"format", "inputs", "proposals"},
+        "knowledge proposals 顶层",
+    )
+    if proposals_document["format"] != FORMAT_VERSION:
+        raise ProposalError("不支持的 knowledge proposals 格式")
+    raw_proposals = proposals_document["proposals"]
+    if not isinstance(raw_proposals, list):
+        raise ProposalError("knowledge proposals.proposals 必须是数组")
+    draft_proposals: list[dict[str, object]] = []
+    for index, proposal in enumerate(raw_proposals):
+        context = f"knowledge proposals.proposals[{index}]"
+        if not isinstance(proposal, dict):
+            raise ProposalError(f"{context} 必须是对象")
+        require_exact_fields(
+            proposal,
+            {
+                "proposal_id",
+                "candidate_ids",
+                "action",
+                "target",
+                "rationale",
+                "operation",
+                "flags",
+            },
+            context,
+        )
+        proposal_id = require_string(proposal["proposal_id"], f"{context}.proposal_id")
+        if not re.fullmatch(r"kp_[0-9a-f]{20}", proposal_id):
+            raise ProposalError(f"{context}.proposal_id 格式非法")
+        draft_proposals.append(
+            {key: value for key, value in proposal.items() if key != "proposal_id"}
+        )
+    draft_document = {
+        "format": DRAFT_FORMAT,
+        "inputs": proposals_document["inputs"],
+        "proposals": draft_proposals,
+    }
+    expected = build_proposals(
+        candidates_document,
+        candidates_sha256,
+        inventory_document,
+        inventory_sha256,
+        retrieval_document,
+        retrieval_sha256,
+        draft_document,
+        knowledge_root,
+    )
+    if proposals_document != expected:
+        raise ProposalError("knowledge proposals 已被修改或不符合确定性结果")
+    return [item for item in raw_proposals if isinstance(item, dict)]
+
+
 def create_proposals_file(
     knowledge_root: Path,
     inventory_path: Path,

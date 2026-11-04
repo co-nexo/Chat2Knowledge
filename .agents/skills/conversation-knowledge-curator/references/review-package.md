@@ -13,14 +13,16 @@
 review/
 ├── review-manifest.json
 ├── proposals.json
-├── decisions.json          # 用户作出决定后生成
+├── decisions.json          # prepare 不生成；用户作出决定后另行创建
 ├── after/
 │   └── <proposal-id>.md
 └── patches/
     └── <proposal-id>.diff
 ```
 
-创建审核包时目标目录必须不存在。`after/` 用于安全应用，`patches/` 用于人工阅读；不得把 diff 当作未经校验的命令执行。
+创建审核包时目标目录必须不存在，并且不得位于正式知识库内部。`after/` 用于安全应用，`patches/` 用于人工阅读；不得把 diff 当作未经校验的命令执行。
+
+运行 `scripts/knowledge_review.py prepare <knowledge-root> <inventory.json> <knowledge-candidates.json> <knowledge-retrieval.json> <knowledge-proposals.json> <new-review-directory>`。程序必须重新校验 inventory、retrieval 和 proposals 的完整关系；任一输入过期或被修改时停止，且不得留下正式审核目录。
 
 ## Review manifest
 
@@ -53,6 +55,27 @@ review/
 没有写操作的 `no_change`、`conflict` 和 `defer` 也应出现在审核清单中，但其 after、diff 和文件哈希字段为 `null`，便于用户确认处置结论。
 
 `review_id` 由规范化后的输入哈希和 entries 生成。审核包任一提案、after 或 diff 变化都必须产生新的身份，不能继承旧批准。
+
+哈希计算规则：
+
+- `proposal_sha256`：对单个规范化 Proposal 使用 UTF-8、按键排序、无多余空白的 JSON 计算；
+- `after_sha256`：对 after 文件的实际字节计算，包含可能保留的 UTF-8 BOM 和 CRLF；
+- `diff_sha256`：对审核包中 UTF-8、LF 换行的 diff 文件实际字节计算；
+- `knowledge_proposals_sha256`：对输入 proposals 文件原始字节计算，审核包中的 `proposals.json` 保留相同字节。
+
+## After 与 diff 生成规则
+
+- `create_document` 生成完整新文件，第一版统一使用 UTF-8、无 BOM、LF 换行；
+- 修改现有文件时保留原文件是否含 UTF-8 BOM，并把 operation Markdown 转为该文件的主要换行风格；
+- `append_to_section` 追加到目标章节直属正文末尾，不越过其子章节；
+- `replace_section` 只替换目标章节标题和直属正文，不替换子章节；
+- `insert_section` 插入到目标章节完整子树之后，避免把新章节意外插入现有子章节之前；
+- diff 使用稳定的 unified diff，不包含时间戳；现有文件使用 `a/<path>` 和 `b/<path>`，新文件从 `/dev/null` 开始；
+- 可写提案如果没有产生实际字节变化，必须失败，不能生成空 diff。
+
+`prepare` 只读取知识库并写入新的审核目录，不创建 `decisions.json`，也不修改、暂存或提交正式 Markdown。
+
+退出码 `0` 表示审核包完整生成，`2` 表示失败且没有正式审核目录。
 
 ## Decisions
 
