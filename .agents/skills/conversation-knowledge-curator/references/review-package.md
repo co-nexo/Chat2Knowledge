@@ -14,13 +14,16 @@ review/
 ├── review-manifest.json
 ├── proposals.json
 ├── decisions.json          # prepare 不生成；用户作出决定后另行创建
+├── apply-manifest.json     # apply 成功后生成
+├── apply-state.json        # 仅 apply 写入期间及成功后的恢复状态
+├── rollback/               # 仅有写操作时保存应用前字节
 ├── after/
 │   └── <proposal-id>.md
 └── patches/
     └── <proposal-id>.diff
 ```
 
-创建审核包时目标目录必须不存在，并且不得位于正式知识库内部。`after/` 用于安全应用，`patches/` 用于人工阅读；不得把 diff 当作未经校验的命令执行。
+创建审核包时目标目录必须不存在，并且不得位于正式知识库内部。`after/` 用于安全应用，`patches/` 用于人工阅读；不得把 diff 当作未经校验的命令执行。`apply-state.json`、`rollback/` 和 `apply-manifest.json` 不是 prepare 的输出，其生成与恢复规则见 [apply-manifest.md](apply-manifest.md)。
 
 运行 `scripts/knowledge_review.py prepare <knowledge-root> <inventory.json> <knowledge-candidates.json> <knowledge-retrieval.json> <knowledge-proposals.json> <new-review-directory>`。程序必须重新校验 inventory、retrieval 和 proposals 的完整关系；任一输入过期或被修改时停止，且不得留下正式审核目录。
 
