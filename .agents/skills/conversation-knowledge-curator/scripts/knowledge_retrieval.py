@@ -12,7 +12,7 @@ from pathlib import Path, PurePosixPath
 
 import knowledge_inventory
 
-FORMAT_VERSION = "conversation-knowledge-curator.knowledge-retrieval.v1"
+FORMAT_VERSION = "conversation-knowledge-curator.knowledge-retrieval.v2"
 CANDIDATES_FORMAT = "conversation-knowledge-curator.knowledge-candidates.v1"
 INVENTORY_FORMAT = "conversation-knowledge-curator.knowledge-inventory.v1"
 ALLOWED_FLAGS = {
@@ -23,7 +23,11 @@ ALLOWED_FLAGS = {
 }
 RESERVED_PARTS = {".git", ".knowledge-curator"}
 LATIN_TERM_PATTERN = re.compile(
-    r"[A-Za-z0-9]+(?:[._+#-][A-Za-z0-9+#]+)*"
+    r"(?<![A-Za-z0-9])(?:"
+    r"\.[A-Za-z][A-Za-z0-9]*|"
+    r"[A-Za-z0-9]+(?:\+[A-Za-z0-9]+)+|"
+    r"[A-Za-z0-9]+(?:\+\+|#)?"
+    r")"
 )
 CJK_TERM_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+")
 
@@ -364,23 +368,24 @@ def score_section(
     section: SearchSection,
     terms: list[str],
 ) -> tuple[int, list[str]]:
-    """按公开权重计算一个章节的字面召回分数。"""
+    """按完整词命中和公开权重计算一个章节的字面召回分数。"""
 
-    path_text = section.path.casefold()
-    title_text = section.title.casefold()
-    heading_text = " ".join(section.heading_path).casefold()
-    body_text = section.markdown.casefold()
+    # 查询和被检索字段使用同一套词项规则，避免 SQL 命中 NoSQL 等子串误判。
+    path_terms = set(query_terms(section.path))
+    title_terms = set(query_terms(section.title))
+    heading_terms = set(query_terms(" ".join(section.heading_path)))
+    body_terms = set(query_terms(section.markdown))
     score = 0
     matched: list[str] = []
     for term in terms:
         term_score = 0
-        if term in path_text:
+        if term in path_terms:
             term_score += 8
-        if term in title_text:
+        if term in title_terms:
             term_score += 6
-        if term in heading_text:
+        if term in heading_terms:
             term_score += 5
-        if term in body_text:
+        if term in body_terms:
             term_score += 1
         if term_score:
             score += term_score
@@ -497,13 +502,18 @@ def create_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     retrieve_parser = subparsers.add_parser(
         "retrieve",
-        help="生成 knowledge-retrieval.v1 JSON 文件",
+        help="生成 knowledge-retrieval.v2 JSON 文件",
     )
     retrieve_parser.add_argument("knowledge_root", type=Path)
     retrieve_parser.add_argument("inventory_file", type=Path)
     retrieve_parser.add_argument("candidates_file", type=Path)
     retrieve_parser.add_argument("output_file", type=Path)
-    retrieve_parser.add_argument("--limit", type=int, default=5)
+    retrieve_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="每个候选最多保留的章节数，默认为 20，允许 1 到 20",
+    )
     return parser
 
 

@@ -9,10 +9,12 @@
 已覆盖的召回行为：
 
 1. 从英文技术词和连续中文生成稳定查询词。
-2. 按路径、文档标题、标题路径和章节正文的公开权重排序。
-3. 每个候选独立限制匹配数量，没有命中时保留空结果。
-4. 输出保留定位、分数和命中词，但不复制候选陈述或 Markdown 正文。
-5. 输入文件哈希和 inventory 警告会进入召回结果。
+2. 英文和技术标识按完整词匹配，避免常见子串误召回。
+3. 按路径、文档标题、标题路径和章节正文的公开权重排序。
+4. 任一查询词命中即可召回，每个候选独立限制匹配数量。
+5. 没有命中时保留空结果，默认最多保留 20 个匹配章节。
+6. 输出保留定位、分数和命中词，但不复制候选陈述或 Markdown 正文。
+7. 输入文件哈希和 inventory 警告会进入召回结果。
 
 已覆盖的 CLI 行为：
 
@@ -235,13 +237,39 @@ class RetrievalInputTests(unittest.TestCase):
 
 class RetrievalRankingTests(unittest.TestCase):
     def test_query_terms_include_latin_words_and_chinese_bigrams(self) -> None:
-        terms = knowledge_retrieval.query_terms("兼容 JetBrains 系列 IDE")
+        terms = knowledge_retrieval.query_terms(
+            "兼容 JetBrains 系列 IDE、C++、C#、.NET 和 B+Tree"
+        )
 
         self.assertIn("jetbrains", terms)
         self.assertIn("ide", terms)
+        self.assertIn("c++", terms)
+        self.assertIn("c#", terms)
+        self.assertIn(".net", terms)
+        self.assertIn("b+tree", terms)
         self.assertIn("兼容", terms)
         self.assertIn("系列", terms)
         self.assertEqual(terms, sorted(set(terms)))
+
+    def test_latin_terms_require_exact_token_matches(self) -> None:
+        section = knowledge_retrieval.SearchSection(
+            path="notes/nosql.md",
+            file_sha256="a" * 64,
+            title="NoSQL and MongoDB",
+            section_id="ks_" + "1" * 20,
+            section_sha256="b" * 64,
+            heading_path=("Indexing",),
+            order=0,
+            markdown="NoSQL MongoDB indexing",
+        )
+
+        score, matched = knowledge_retrieval.score_section(
+            section,
+            ["sql", "go", "index"],
+        )
+
+        self.assertEqual(score, 0)
+        self.assertEqual(matched, [])
 
     def test_retrieval_ranks_relevant_sections_and_keeps_empty_results(self) -> None:
         result = knowledge_retrieval.build_retrieval(
@@ -353,8 +381,6 @@ class RetrievalCliTests(unittest.TestCase):
                         str(inventory_path),
                         str(candidates_path),
                         str(output_path),
-                        "--limit",
-                        "2",
                     ]
                 )
 
@@ -365,9 +391,9 @@ class RetrievalCliTests(unittest.TestCase):
             self.assertEqual(summary["candidate_count"], 3)
             self.assertEqual(
                 output["format"],
-                "conversation-knowledge-curator.knowledge-retrieval.v1",
+                "conversation-knowledge-curator.knowledge-retrieval.v2",
             )
-            self.assertEqual(output["parameters"], {"limit": 2})
+            self.assertEqual(output["parameters"], {"limit": 20})
             self.assertEqual(
                 output["inputs"]["knowledge_candidates_sha256"],
                 hashlib.sha256(candidates_path.read_bytes()).hexdigest(),

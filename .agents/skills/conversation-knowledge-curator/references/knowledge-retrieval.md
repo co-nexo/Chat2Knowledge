@@ -1,6 +1,6 @@
 # knowledge retrieval 格式契约
 
-当前格式版本：`conversation-knowledge-curator.knowledge-retrieval.v1`
+当前格式版本：`conversation-knowledge-curator.knowledge-retrieval.v2`
 
 Knowledge retrieval 是从知识候选到现有 Markdown 章节的确定性关键词召回结果。它只缩小 Codex 后续需要阅读的范围，不判断内容是否等价、冲突或应该写入知识库。
 
@@ -8,20 +8,21 @@ Knowledge retrieval 是从知识候选到现有 Markdown 章节的确定性关�
 
 | 版本 | 状态 | 主要差异 |
 |---|---|---|
-| v1 | 当前版本 | 按文件、标题、标题路径和章节正文进行可解释的关键词排序 |
+| v2 | 当前版本 | 完整词匹配；默认每个候选保留 20 个章节 |
+| v1 | 不再生成 | 子串匹配；默认每个候选保留 5 个章节 |
 
 ## 顶层结构
 
 ```json
 {
-  "format": "conversation-knowledge-curator.knowledge-retrieval.v1",
+  "format": "conversation-knowledge-curator.knowledge-retrieval.v2",
   "status": "ok",
   "inputs": {
     "knowledge_candidates_sha256": "hex",
     "knowledge_inventory_sha256": "hex"
   },
   "parameters": {
-    "limit": 5
+    "limit": 20
   },
   "results": [],
   "warnings": []
@@ -30,7 +31,7 @@ Knowledge retrieval 是从知识候选到现有 Markdown 章节的确定性关�
 
 - `status` 和 `warnings` 继承 inventory 的完整性状态。被跳过的链接不会因召回阶段而消失。
 - 输入哈希针对实际 JSON 文件字节计算，用于把召回结果绑定到候选和知识库快照。
-- `limit` 是每个候选最多保留的匹配章节数，第一版允许 `1` 到 `20`。
+- `limit` 是每个候选最多保留的匹配章节数，默认为 `20`，第一版允许 `1` 到 `20`。当前默认值优先减少漏召回，不能把 Top 20 理解为 20 条都与候选语义相关。
 - `results` 与候选一一对应，按 `candidate_id` 稳定排序；没有匹配时保留空 `matches`。
 
 ## Result
@@ -67,11 +68,23 @@ Knowledge retrieval 是从知识候选到现有 Markdown 章节的确定性关�
 
 第一版不依赖分词库、Embedding 或数据库：
 
-- 英文、数字和常见技术标识按连续词提取并转为小写。
+- 英文、数字和常见技术标识按完整词提取并转为小写；支持 `C++`、`C#`、`.NET` 和 `B+Tree` 这类常见写法。
 - 连续中文文本只生成相邻双字词；单个汉字和完整长句不进入输出，避免通过 `matched_terms` 复制候选原文。
+- 查询和路径、标题、标题路径、正文采用同一套词项提取规则，并按完整词匹配。`SQL` 不会命中 `NoSQL`，`Go` 不会命中 `MongoDB`，`index` 不会命中 `indexing`。
 - 同一关键词在路径、文档标题、标题路径和章节正文中分别只计分一次。
 - 路径命中权重为 `8`，文档标题为 `6`，标题路径为 `5`，章节正文为 `1`。
-- 得分为 `0` 的章节不输出；算法只做字面包含匹配，不进行语义扩展。
+- 任一查询词命中即可召回，得分为 `0` 的章节不输出；当前不设置最低分阈值。
+- 算法只做字面词项匹配，不进行同义词、缩写或其他语义扩展。Codex 必须在后续阶段阅读必要原文并判断相关性。
+
+## 召回策略与评估边界
+
+当前版本优先为后续语义判断提供较宽的候选范围，但在建立标注样本前，不宣称算法已经达到“高召回率”。权重和默认数量只是初始规则，不应根据少量个案频繁调整。
+
+后续应使用真实脱敏样本建立评估集，至少记录：
+
+- `Recall@5`、`Recall@10` 和 `Recall@20`，检查应召回章节是否进入前 N 名；
+- `Precision@5`，观察靠前结果中有多少确实相关；
+- 漏召回原因和误召回原因，用于决定是否需要中文停用词、IDF、短语邻近或其他改进。
 
 ## 输入与安全校验
 
