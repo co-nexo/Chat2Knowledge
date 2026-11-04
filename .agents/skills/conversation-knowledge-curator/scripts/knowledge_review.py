@@ -7,6 +7,7 @@ import argparse
 import difflib
 import hashlib
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -17,12 +18,47 @@ import knowledge_proposals
 import knowledge_retrieval
 
 FORMAT_VERSION = "conversation-knowledge-curator.review-manifest.v1"
+DECISIONS_FORMAT = "conversation-knowledge-curator.review-decisions.v1"
+DECISION_DRAFT_FORMAT = "conversation-knowledge-curator.review-decision-draft.v1"
 UTF8_BOM = b"\xef\xbb\xbf"
 WRITABLE_ACTIONS = {"add", "merge"}
+NON_WRITABLE_ACTIONS = {"no_change", "conflict", "defer"}
+DECISION_VALUES = {"approved", "rejected"}
 
 
 class ReviewError(Exception):
     """表示审核包输入、修改模拟或输出不符合契约。"""
+
+
+def require_exact_fields(
+    value: dict[str, object],
+    expected: set[str],
+    context: str,
+) -> None:
+    """拒绝缺失或契约未声明的 JSON 字段。"""
+
+    try:
+        knowledge_proposals.require_exact_fields(value, expected, context)
+    except knowledge_proposals.ProposalError as exc:
+        raise ReviewError(str(exc)) from exc
+
+
+def require_string(value: object, context: str) -> str:
+    """返回去除首尾空白后的非空字符串。"""
+
+    try:
+        return knowledge_proposals.require_string(value, context)
+    except knowledge_proposals.ProposalError as exc:
+        raise ReviewError(str(exc)) from exc
+
+
+def require_sha256(value: object, context: str) -> str:
+    """校验小写 SHA-256 字符串。"""
+
+    try:
+        return knowledge_proposals.require_sha256(value, context)
+    except knowledge_proposals.ProposalError as exc:
+        raise ReviewError(str(exc)) from exc
 
 
 def canonical_json_bytes(value: object) -> bytes:
@@ -305,6 +341,443 @@ def build_review_package(
     return manifest, artifacts
 
 
+def load_review_json(path: Path, context: str) -> tuple[dict[str, object], bytes]:
+    """读取审核包 JSON，并把底层读取错误统一为审核错误。"""
+
+    try:
+        return knowledge_retrieval.load_json_document(path, context)
+    except knowledge_retrieval.RetrievalError as exc:
+        raise ReviewError(str(exc)) from exc
+
+
+def read_review_artifact(
+    review_root: Path,
+    relative_path: str,
+    context: str,
+) -> bytes:
+    """读取审核包内固定相对路径，并拒绝链接和目录逃逸。"""
+
+    path = review_root.joinpath(*PurePosixPath(relative_path).parts)
+    if knowledge_inventory.is_link_like(path):
+        raise ReviewError(f"{context} 不得是链接：{relative_path}")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise ReviewError(f"{context} 不存在：{relative_path}") from exc
+    if not knowledge_inventory.is_within(resolved, review_root) or not resolved.is_file():
+        raise ReviewError(f"{context} 不是审核包内普通文件：{relative_path}")
+    try:
+        return resolved.read_bytes()
+    except OSError as exc:
+        raise ReviewError(f"无法读取{context}：{relative_path}") from exc
+
+
+def validate_proposals_copy(
+    document: dict[str, object],
+) -> dict[str, dict[str, object]]:
+    """校验审核包 proposals 副本的公开结构和唯一 ID。"""
+
+    require_exact_fields(document, {"format", "inputs", "proposals"}, "proposals 顶层")
+    if document["format"] != knowledge_proposals.FORMAT_VERSION:
+        raise ReviewError("审核包包含不支持的 knowledge proposals 格式")
+    inputs = document["inputs"]
+    if not isinstance(inputs, dict):
+        raise ReviewError("proposals.inputs 必须是对象")
+    require_exact_fields(
+        inputs,
+        {
+            "knowledge_candidates_sha256",
+            "knowledge_inventory_sha256",
+            "knowledge_retrieval_sha256",
+        },
+        "proposals.inputs",
+    )
+    for name, value in inputs.items():
+        require_sha256(value, f"proposals.inputs.{name}")
+
+    raw_proposals = document["proposals"]
+    if not isinstance(raw_proposals, list):
+        raise ReviewError("proposals.proposals 必须是数组")
+    proposals: dict[str, dict[str, object]] = {}
+    proposal_ids: list[str] = []
+    for index, proposal in enumerate(raw_proposals):
+        context = f"proposals.proposals[{index}]"
+        if not isinstance(proposal, dict):
+            raise ReviewError(f"{context} 必须是对象")
+        require_exact_fields(
+            proposal,
+            {
+                "proposal_id",
+                "candidate_ids",
+                "action",
+                "target",
+                "rationale",
+                "operation",
+                "flags",
+            },
+            context,
+        )
+        proposal_id = require_string(proposal["proposal_id"], f"{context}.proposal_id")
+        if not re.fullmatch(r"kp_[0-9a-f]{20}", proposal_id):
+            raise ReviewError(f"{context}.proposal_id 格式非法")
+        if proposal_id in proposals:
+            raise ReviewError(f"proposal_id 重复：{proposal_id}")
+        candidate_ids = proposal["candidate_ids"]
+        if not isinstance(candidate_ids, list) or not candidate_ids or any(
+            not isinstance(candidate_id, str) for candidate_id in candidate_ids
+        ):
+            raise ReviewError(f"{context}.candidate_ids 必须是非空字符串数组")
+        action = require_string(proposal["action"], f"{context}.action")
+        if action not in WRITABLE_ACTIONS | NON_WRITABLE_ACTIONS:
+            raise ReviewError(f"{context}.action 非法")
+        proposals[proposal_id] = proposal
+        proposal_ids.append(proposal_id)
+    if proposal_ids != sorted(proposal_ids):
+        raise ReviewError("proposals 必须按 proposal_id 排序")
+    return proposals
+
+
+def validate_review_entry(
+    entry: object,
+    proposal: dict[str, object],
+    review_root: Path,
+    context: str,
+) -> dict[str, object]:
+    """校验一个 manifest entry 与 Proposal 和审核文件完全一致。"""
+
+    if not isinstance(entry, dict):
+        raise ReviewError(f"{context} 必须是对象")
+    require_exact_fields(
+        entry,
+        {
+            "proposal_id",
+            "proposal_sha256",
+            "candidate_ids",
+            "action",
+            "target_path",
+            "base_file_sha256",
+            "after_path",
+            "after_sha256",
+            "diff_path",
+            "diff_sha256",
+        },
+        context,
+    )
+    proposal_id = require_string(entry["proposal_id"], f"{context}.proposal_id")
+    if proposal_id != proposal["proposal_id"]:
+        raise ReviewError(f"{context}.proposal_id 与 proposals 不一致")
+    expected_proposal_sha256 = proposal_sha256(proposal)
+    if require_sha256(
+        entry["proposal_sha256"],
+        f"{context}.proposal_sha256",
+    ) != expected_proposal_sha256:
+        raise ReviewError(f"{context}.proposal_sha256 不匹配")
+    if entry["candidate_ids"] != proposal["candidate_ids"]:
+        raise ReviewError(f"{context}.candidate_ids 与 Proposal 不一致")
+    if entry["action"] != proposal["action"]:
+        raise ReviewError(f"{context}.action 与 Proposal 不一致")
+    expected_target_path = target_path_of(proposal)
+    if entry["target_path"] != expected_target_path:
+        raise ReviewError(f"{context}.target_path 与 Proposal 不一致")
+
+    action = str(proposal["action"])
+    if action in WRITABLE_ACTIONS:
+        after_path = require_string(entry["after_path"], f"{context}.after_path")
+        diff_path = require_string(entry["diff_path"], f"{context}.diff_path")
+        if after_path != f"after/{proposal_id}.md":
+            raise ReviewError(f"{context}.after_path 非法")
+        if diff_path != f"patches/{proposal_id}.diff":
+            raise ReviewError(f"{context}.diff_path 非法")
+        after_bytes = read_review_artifact(review_root, after_path, "after 文件")
+        diff_bytes = read_review_artifact(review_root, diff_path, "diff 文件")
+        if not diff_bytes:
+            raise ReviewError(f"{context} 的 diff 不得为空")
+        if require_sha256(entry["after_sha256"], f"{context}.after_sha256") != (
+            sha256_bytes(after_bytes)
+        ):
+            raise ReviewError(f"{context}.after_sha256 不匹配")
+        if require_sha256(entry["diff_sha256"], f"{context}.diff_sha256") != (
+            sha256_bytes(diff_bytes)
+        ):
+            raise ReviewError(f"{context}.diff_sha256 不匹配")
+        operation = proposal["operation"]
+        target = proposal["target"]
+        if not isinstance(operation, dict) or not isinstance(target, dict):
+            raise ReviewError(f"{context} 的可写 Proposal 结构非法")
+        if operation["type"] == "create_document":
+            if entry["base_file_sha256"] is not None:
+                raise ReviewError(f"{context}.base_file_sha256 应为 null")
+        else:
+            base_sha256 = require_sha256(
+                entry["base_file_sha256"],
+                f"{context}.base_file_sha256",
+            )
+            if base_sha256 != target["file_sha256"]:
+                raise ReviewError(f"{context}.base_file_sha256 与 Proposal 不一致")
+    else:
+        for field in (
+            "base_file_sha256",
+            "after_path",
+            "after_sha256",
+            "diff_path",
+            "diff_sha256",
+        ):
+            if entry[field] is not None:
+                raise ReviewError(f"{context}.{field} 在非写入提案中必须为 null")
+    return entry
+
+
+def validate_review_package(
+    review_directory: Path,
+) -> tuple[dict[str, object], dict[str, dict[str, object]]]:
+    """校验审核清单、提案副本和全部 after/diff 文件的内部一致性。"""
+
+    if knowledge_inventory.is_link_like(review_directory):
+        raise ReviewError("审核目录不得是链接")
+    try:
+        review_root = review_directory.resolve(strict=True)
+    except OSError as exc:
+        raise ReviewError(f"审核目录不存在：{review_directory}") from exc
+    if not review_root.is_dir():
+        raise ReviewError(f"审核路径不是目录：{review_directory}")
+    manifest, _ = load_review_json(
+        review_root / "review-manifest.json",
+        "review manifest",
+    )
+    proposals_document, proposals_raw = load_review_json(
+        review_root / "proposals.json",
+        "knowledge proposals",
+    )
+    require_exact_fields(
+        manifest,
+        {"format", "review_id", "inputs", "entries"},
+        "review manifest 顶层",
+    )
+    if manifest["format"] != FORMAT_VERSION:
+        raise ReviewError("不支持的 review manifest 格式")
+    review_id = require_string(manifest["review_id"], "review manifest.review_id")
+    if not re.fullmatch(r"kr_[0-9a-f]{20}", review_id):
+        raise ReviewError("review manifest.review_id 格式非法")
+    inputs = manifest["inputs"]
+    if not isinstance(inputs, dict):
+        raise ReviewError("review manifest.inputs 必须是对象")
+    require_exact_fields(
+        inputs,
+        {
+            "knowledge_candidates_sha256",
+            "knowledge_inventory_sha256",
+            "knowledge_proposals_sha256",
+        },
+        "review manifest.inputs",
+    )
+    normalized_inputs = {
+        name: require_sha256(value, f"review manifest.inputs.{name}")
+        for name, value in inputs.items()
+    }
+    if normalized_inputs["knowledge_proposals_sha256"] != sha256_bytes(proposals_raw):
+        raise ReviewError("审核包 proposals.json 哈希不匹配")
+    proposals = validate_proposals_copy(proposals_document)
+    proposal_inputs = proposals_document["inputs"]
+    assert isinstance(proposal_inputs, dict)
+    if (
+        proposal_inputs["knowledge_candidates_sha256"]
+        != normalized_inputs["knowledge_candidates_sha256"]
+        or proposal_inputs["knowledge_inventory_sha256"]
+        != normalized_inputs["knowledge_inventory_sha256"]
+    ):
+        raise ReviewError("review manifest 与 proposals 的上游输入哈希不一致")
+
+    raw_entries = manifest["entries"]
+    if not isinstance(raw_entries, list):
+        raise ReviewError("review manifest.entries 必须是数组")
+    entries: list[dict[str, object]] = []
+    seen_ids: set[str] = set()
+    for index, raw_entry in enumerate(raw_entries):
+        context = f"review manifest.entries[{index}]"
+        if not isinstance(raw_entry, dict):
+            raise ReviewError(f"{context} 必须是对象")
+        proposal_id = require_string(raw_entry.get("proposal_id"), f"{context}.proposal_id")
+        if proposal_id in seen_ids:
+            raise ReviewError(f"review manifest proposal_id 重复：{proposal_id}")
+        proposal = proposals.get(proposal_id)
+        if proposal is None:
+            raise ReviewError(f"review manifest 引用了不存在的 Proposal：{proposal_id}")
+        seen_ids.add(proposal_id)
+        entries.append(
+            validate_review_entry(raw_entry, proposal, review_root, context)
+        )
+    if seen_ids != set(proposals):
+        raise ReviewError("review manifest 未完整覆盖 proposals")
+    if [entry["proposal_id"] for entry in entries] != sorted(seen_ids):
+        raise ReviewError("review manifest.entries 必须按 proposal_id 排序")
+    expected_review_id = review_id_for(normalized_inputs, entries)
+    if review_id != expected_review_id:
+        raise ReviewError("review_id 与审核包内容不一致")
+    return manifest, proposals
+
+
+def build_review_decisions(
+    review_manifest: dict[str, object],
+    draft_document: dict[str, object],
+) -> dict[str, object]:
+    """把用户明确选择的 decision draft 绑定到具体审核条目哈希。"""
+
+    require_exact_fields(
+        draft_document,
+        {"format", "review_id", "decisions"},
+        "decision draft 顶层",
+    )
+    if draft_document["format"] != DECISION_DRAFT_FORMAT:
+        raise ReviewError("不支持的 review decision draft 格式")
+    review_id = require_string(draft_document["review_id"], "decision draft.review_id")
+    if review_id != review_manifest["review_id"]:
+        raise ReviewError("decision draft.review_id 与审核包不一致")
+    raw_entries = review_manifest["entries"]
+    assert isinstance(raw_entries, list)
+    manifest_entries = {str(entry["proposal_id"]): entry for entry in raw_entries}
+    raw_decisions = draft_document["decisions"]
+    if not isinstance(raw_decisions, list):
+        raise ReviewError("decision draft.decisions 必须是数组")
+    seen_ids: set[str] = set()
+    decisions: list[dict[str, object]] = []
+    for index, raw_decision in enumerate(raw_decisions):
+        context = f"decision draft.decisions[{index}]"
+        if not isinstance(raw_decision, dict):
+            raise ReviewError(f"{context} 必须是对象")
+        require_exact_fields(
+            raw_decision,
+            {"proposal_id", "decision", "note"},
+            context,
+        )
+        proposal_id = require_string(
+            raw_decision["proposal_id"],
+            f"{context}.proposal_id",
+        )
+        if proposal_id in seen_ids:
+            raise ReviewError(f"同一 Proposal 存在多个决定：{proposal_id}")
+        manifest_entry = manifest_entries.get(proposal_id)
+        if manifest_entry is None:
+            raise ReviewError(f"决定引用了不存在的 Proposal：{proposal_id}")
+        seen_ids.add(proposal_id)
+        decision = require_string(raw_decision["decision"], f"{context}.decision")
+        if decision not in DECISION_VALUES:
+            raise ReviewError(f"{context}.decision 只能是 approved 或 rejected")
+        note_value = raw_decision["note"]
+        if note_value is None:
+            note = None
+        elif isinstance(note_value, str) and note_value.strip():
+            note = note_value.strip()
+        else:
+            raise ReviewError(f"{context}.note 必须是 null 或非空字符串")
+        decisions.append(
+            {
+                "proposal_id": proposal_id,
+                "proposal_sha256": manifest_entry["proposal_sha256"],
+                "diff_sha256": manifest_entry["diff_sha256"],
+                "decision": decision,
+                "note": note,
+            }
+        )
+    decisions.sort(key=lambda item: str(item["proposal_id"]))
+    return {
+        "format": DECISIONS_FORMAT,
+        "review_id": review_id,
+        "decisions": decisions,
+    }
+
+
+def validate_review_decisions(
+    review_manifest: dict[str, object],
+    decisions_document: dict[str, object],
+) -> list[dict[str, object]]:
+    """校验最终 decisions 与当前 review manifest 的哈希绑定。"""
+
+    require_exact_fields(
+        decisions_document,
+        {"format", "review_id", "decisions"},
+        "review decisions 顶层",
+    )
+    if decisions_document["format"] != DECISIONS_FORMAT:
+        raise ReviewError("不支持的 review decisions 格式")
+    review_id = require_string(
+        decisions_document["review_id"],
+        "review decisions.review_id",
+    )
+    if review_id != review_manifest["review_id"]:
+        raise ReviewError("review decisions.review_id 与审核包不一致")
+    raw_manifest_entries = review_manifest["entries"]
+    assert isinstance(raw_manifest_entries, list)
+    manifest_entries = {
+        str(entry["proposal_id"]): entry for entry in raw_manifest_entries
+    }
+    raw_decisions = decisions_document["decisions"]
+    if not isinstance(raw_decisions, list):
+        raise ReviewError("review decisions.decisions 必须是数组")
+    seen_ids: set[str] = set()
+    decisions: list[dict[str, object]] = []
+    for index, decision_entry in enumerate(raw_decisions):
+        context = f"review decisions.decisions[{index}]"
+        if not isinstance(decision_entry, dict):
+            raise ReviewError(f"{context} 必须是对象")
+        require_exact_fields(
+            decision_entry,
+            {
+                "proposal_id",
+                "proposal_sha256",
+                "diff_sha256",
+                "decision",
+                "note",
+            },
+            context,
+        )
+        proposal_id = require_string(
+            decision_entry["proposal_id"],
+            f"{context}.proposal_id",
+        )
+        if proposal_id in seen_ids:
+            raise ReviewError(f"同一 Proposal 存在多个最终决定：{proposal_id}")
+        manifest_entry = manifest_entries.get(proposal_id)
+        if manifest_entry is None:
+            raise ReviewError(f"最终决定引用了不存在的 Proposal：{proposal_id}")
+        seen_ids.add(proposal_id)
+        if decision_entry["proposal_sha256"] != manifest_entry["proposal_sha256"]:
+            raise ReviewError(f"{context}.proposal_sha256 与审核清单不一致")
+        if decision_entry["diff_sha256"] != manifest_entry["diff_sha256"]:
+            raise ReviewError(f"{context}.diff_sha256 与审核清单不一致")
+        decision = require_string(decision_entry["decision"], f"{context}.decision")
+        if decision not in DECISION_VALUES:
+            raise ReviewError(f"{context}.decision 非法")
+        note = decision_entry["note"]
+        if note is not None and (not isinstance(note, str) or not note.strip()):
+            raise ReviewError(f"{context}.note 必须是 null 或非空字符串")
+        decisions.append(decision_entry)
+    if [item["proposal_id"] for item in decisions] != sorted(seen_ids):
+        raise ReviewError("review decisions 必须按 proposal_id 排序")
+    return decisions
+
+
+def create_decisions_file(
+    review_directory: Path,
+    draft_path: Path,
+) -> dict[str, object]:
+    """校验审核包和决定草稿后独占创建 decisions.json。"""
+
+    output_path = review_directory / "decisions.json"
+    if output_path.exists():
+        raise ReviewError(f"审核决定文件已存在：{output_path}")
+    review_manifest, _ = validate_review_package(review_directory)
+    draft_document, _ = load_review_json(draft_path, "review decision draft")
+    result = build_review_decisions(review_manifest, draft_document)
+    try:
+        knowledge_inventory.write_new_file(
+            output_path,
+            knowledge_inventory.serialize_json(result),
+        )
+    except knowledge_inventory.InventoryError as exc:
+        raise ReviewError(str(exc)) from exc
+    return result
+
+
 def write_package_file(root: Path, relative_path: str, content: bytes) -> None:
     """在新建临时审核目录内独占写入一个文件。"""
 
@@ -406,6 +879,12 @@ def create_parser() -> argparse.ArgumentParser:
     prepare_parser.add_argument("retrieval_file", type=Path)
     prepare_parser.add_argument("proposals_file", type=Path)
     prepare_parser.add_argument("output_directory", type=Path)
+    decide_parser = subparsers.add_parser(
+        "decide",
+        help="校验用户决定并在审核目录中生成 decisions.json",
+    )
+    decide_parser.add_argument("review_directory", type=Path)
+    decide_parser.add_argument("decision_draft", type=Path)
     return parser
 
 
@@ -415,16 +894,56 @@ def main(argv: list[str] | None = None) -> int:
     parser = create_parser()
     args = parser.parse_args(argv)
     try:
-        if args.command != "prepare":
+        if args.command == "prepare":
+            manifest = create_review_package(
+                args.knowledge_root,
+                args.inventory_file,
+                args.candidates_file,
+                args.retrieval_file,
+                args.proposals_file,
+                args.output_directory,
+            )
+            entries = manifest["entries"]
+            assert isinstance(entries, list)
+            writable_count = sum(
+                1
+                for entry in entries
+                if isinstance(entry, dict) and entry["after_path"] is not None
+            )
+            summary = {
+                "status": "ok",
+                "review_id": manifest["review_id"],
+                "proposal_count": len(entries),
+                "writable_count": writable_count,
+                "output": str(args.output_directory.resolve()),
+            }
+        elif args.command == "decide":
+            decisions = create_decisions_file(
+                args.review_directory,
+                args.decision_draft,
+            )
+            raw_decisions = decisions["decisions"]
+            assert isinstance(raw_decisions, list)
+            summary = {
+                "status": "ok",
+                "review_id": decisions["review_id"],
+                "decision_count": len(raw_decisions),
+                "approved_count": sum(
+                    1
+                    for decision in raw_decisions
+                    if isinstance(decision, dict)
+                    and decision["decision"] == "approved"
+                ),
+                "rejected_count": sum(
+                    1
+                    for decision in raw_decisions
+                    if isinstance(decision, dict)
+                    and decision["decision"] == "rejected"
+                ),
+                "output": str((args.review_directory / "decisions.json").resolve()),
+            }
+        else:
             parser.error("未知命令")
-        manifest = create_review_package(
-            args.knowledge_root,
-            args.inventory_file,
-            args.candidates_file,
-            args.retrieval_file,
-            args.proposals_file,
-            args.output_directory,
-        )
     except (
         ReviewError,
         knowledge_proposals.ProposalError,
@@ -435,19 +954,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"错误：{exc}", file=sys.stderr)
         return 2
 
-    entries = manifest["entries"]
-    writable_count = sum(
-        1
-        for entry in entries
-        if isinstance(entry, dict) and entry["after_path"] is not None
-    )
-    summary = {
-        "status": "ok",
-        "review_id": manifest["review_id"],
-        "proposal_count": len(entries),
-        "writable_count": writable_count,
-        "output": str(args.output_directory.resolve()),
-    }
     print(knowledge_inventory.serialize_json(summary), end="")
     return 0
 

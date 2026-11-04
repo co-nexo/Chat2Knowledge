@@ -18,6 +18,13 @@
 
 1. 成功时发布完整审核目录并输出结构化汇总。
 2. 输入失败时返回退出码 2 且不创建审核目录。
+
+已覆盖的审核决定行为：
+
+1. 只记录草稿中明确选择的 Proposal，缺少决定不会默认批准。
+2. proposal 和 diff 哈希从已验证 manifest 派生，支持写入与非写入提案。
+3. 拒绝未知、重复或非法决定，以及被修改的审核文件。
+4. decisions.json 独占创建，CLI 输出批准和拒绝数量。
 """
 
 from __future__ import annotations
@@ -252,6 +259,30 @@ def build_review(
         json_sha256(proposals),
         knowledge_root,
     )
+
+
+def create_review_fixture(root: Path) -> tuple[Path, dict[str, object]]:
+    """在测试临时目录中创建完整、可继续审核的 review package。"""
+
+    candidates, inventory, retrieval, proposals = build_stage_documents()
+    inventory_path = root / "inventory.json"
+    candidates_path = root / "candidates.json"
+    retrieval_path = root / "retrieval.json"
+    proposals_path = root / "proposals.json"
+    review_path = root / "review"
+    write_json(inventory_path, inventory)
+    write_json(candidates_path, candidates)
+    write_json(retrieval_path, retrieval)
+    write_json(proposals_path, proposals)
+    manifest = knowledge_review.create_review_package(
+        FIXTURE_ROOT,
+        inventory_path,
+        candidates_path,
+        retrieval_path,
+        proposals_path,
+        review_path,
+    )
+    return review_path, manifest
 
 
 class ReviewValidationTests(unittest.TestCase):
@@ -518,6 +549,197 @@ class ReviewEncodingTests(unittest.TestCase):
         diff = artifacts[entry["diff_path"]].decode("utf-8")
         self.assertTrue(diff.startswith("--- /dev/null\n+++ b/new/jetbrains.md\n"))
         self.assertIsNone(entry["base_file_sha256"])
+
+
+class ReviewDecisionTests(unittest.TestCase):
+    def test_partial_decisions_bind_hashes_from_manifest(self) -> None:
+        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
+            root = Path(directory)
+            review_path, manifest = create_review_fixture(root)
+            writable = next(
+                entry for entry in manifest["entries"] if entry["action"] == "merge"
+            )
+            no_change = next(
+                entry
+                for entry in manifest["entries"]
+                if entry["action"] == "no_change"
+            )
+            draft_path = root / "decision-draft.json"
+            write_json(
+                draft_path,
+                {
+                    "format": (
+                        "conversation-knowledge-curator."
+                        "review-decision-draft.v1"
+                    ),
+                    "review_id": manifest["review_id"],
+                    "decisions": [
+                        {
+                            "proposal_id": writable["proposal_id"],
+                            "decision": "approved",
+                            "note": "已检查 diff。",
+                        },
+                        {
+                            "proposal_id": no_change["proposal_id"],
+                            "decision": "rejected",
+                            "note": None,
+                        },
+                    ],
+                },
+            )
+
+            result = knowledge_review.create_decisions_file(review_path, draft_path)
+
+            self.assertEqual(
+                result["format"],
+                "conversation-knowledge-curator.review-decisions.v1",
+            )
+            self.assertEqual(len(result["decisions"]), 2)
+            by_id = {item["proposal_id"]: item for item in result["decisions"]}
+            self.assertEqual(
+                by_id[writable["proposal_id"]]["proposal_sha256"],
+                writable["proposal_sha256"],
+            )
+            self.assertEqual(
+                by_id[writable["proposal_id"]]["diff_sha256"],
+                writable["diff_sha256"],
+            )
+            self.assertIsNone(by_id[no_change["proposal_id"]]["diff_sha256"])
+            self.assertEqual(
+                {item["proposal_id"] for item in result["decisions"]},
+                {writable["proposal_id"], no_change["proposal_id"]},
+            )
+
+    def test_unknown_duplicate_and_invalid_decisions_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
+            root = Path(directory)
+            _, manifest = create_review_fixture(root)
+            proposal_id = manifest["entries"][0]["proposal_id"]
+            base = {
+                "format": (
+                    "conversation-knowledge-curator.review-decision-draft.v1"
+                ),
+                "review_id": manifest["review_id"],
+                "decisions": [],
+            }
+            unknown = {**base, "decisions": [
+                {
+                    "proposal_id": "kp_" + "f" * 20,
+                    "decision": "approved",
+                    "note": None,
+                }
+            ]}
+            duplicate_entry = {
+                "proposal_id": proposal_id,
+                "decision": "approved",
+                "note": None,
+            }
+            duplicate = {**base, "decisions": [duplicate_entry, duplicate_entry]}
+            invalid = {**base, "decisions": [
+                {
+                    "proposal_id": proposal_id,
+                    "decision": "maybe",
+                    "note": None,
+                }
+            ]}
+
+            for draft in (unknown, duplicate, invalid):
+                with self.subTest(draft=draft), self.assertRaises(
+                    knowledge_review.ReviewError
+                ):
+                    knowledge_review.build_review_decisions(manifest, draft)
+
+    def test_tampered_diff_prevents_decision_file(self) -> None:
+        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
+            root = Path(directory)
+            review_path, manifest = create_review_fixture(root)
+            writable = next(
+                entry for entry in manifest["entries"] if entry["diff_path"] is not None
+            )
+            diff_path = review_path.joinpath(*Path(writable["diff_path"]).parts)
+            diff_path.write_text("tampered\n", encoding="utf-8")
+            draft_path = root / "decision-draft.json"
+            write_json(
+                draft_path,
+                {
+                    "format": (
+                        "conversation-knowledge-curator."
+                        "review-decision-draft.v1"
+                    ),
+                    "review_id": manifest["review_id"],
+                    "decisions": [
+                        {
+                            "proposal_id": writable["proposal_id"],
+                            "decision": "approved",
+                            "note": None,
+                        }
+                    ],
+                },
+            )
+
+            with self.assertRaises(knowledge_review.ReviewError):
+                knowledge_review.create_decisions_file(review_path, draft_path)
+
+            self.assertFalse((review_path / "decisions.json").exists())
+
+    def test_existing_decisions_file_is_not_overwritten(self) -> None:
+        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
+            root = Path(directory)
+            review_path, _ = create_review_fixture(root)
+            decisions_path = review_path / "decisions.json"
+            decisions_path.write_text("keep", encoding="utf-8")
+
+            with self.assertRaises(knowledge_review.ReviewError):
+                knowledge_review.create_decisions_file(
+                    review_path,
+                    root / "missing-draft.json",
+                )
+
+            self.assertEqual(decisions_path.read_text(encoding="utf-8"), "keep")
+
+    def test_decide_cli_reports_approved_and_rejected_counts(self) -> None:
+        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
+            root = Path(directory)
+            review_path, manifest = create_review_fixture(root)
+            first, second = manifest["entries"][:2]
+            draft_path = root / "decision-draft.json"
+            write_json(
+                draft_path,
+                {
+                    "format": (
+                        "conversation-knowledge-curator."
+                        "review-decision-draft.v1"
+                    ),
+                    "review_id": manifest["review_id"],
+                    "decisions": [
+                        {
+                            "proposal_id": first["proposal_id"],
+                            "decision": "approved",
+                            "note": None,
+                        },
+                        {
+                            "proposal_id": second["proposal_id"],
+                            "decision": "rejected",
+                            "note": "暂不采用。",
+                        },
+                    ],
+                },
+            )
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
+                stderr
+            ):
+                exit_code = knowledge_review.main(
+                    ["decide", str(review_path), str(draft_path)]
+                )
+
+            self.assertEqual(exit_code, 0, stderr.getvalue())
+            summary = json.loads(stdout.getvalue())
+            self.assertEqual(summary["approved_count"], 1)
+            self.assertEqual(summary["rejected_count"], 1)
+            self.assertTrue((review_path / "decisions.json").is_file())
 
 
 class ReviewPackageCliTests(unittest.TestCase):

@@ -79,6 +79,26 @@ review/
 
 ## Decisions
 
+人工审核后，先准备只包含用户明确选择的草稿：
+
+```json
+{
+  "format": "conversation-knowledge-curator.review-decision-draft.v1",
+  "review_id": "kr_<hash>",
+  "decisions": [
+    {
+      "proposal_id": "kp_<hash>",
+      "decision": "approved",
+      "note": null
+    }
+  ]
+}
+```
+
+运行 `scripts/knowledge_review.py decide <review-directory> <decision-draft.json>`。脚本重新校验 `review-manifest.json`、`proposals.json`、全部 after 和 diff，再从 manifest 派生 `proposal_sha256` 与 `diff_sha256`，独占创建 `decisions.json`。草稿不得自行提供或覆盖这些哈希。
+
+只有用户明确点名或明确确认的 Proposal 才能进入草稿。Codex 不得把“继续”“看起来可以”或生成审核包的请求推断为批准。草稿可以只包含部分 Proposal；未出现的 Proposal 等同于未批准。
+
 ```json
 {
   "format": "conversation-knowledge-curator.review-decisions.v1",
@@ -100,6 +120,9 @@ review/
 - 非写入提案的 `diff_sha256` 为 `null`，决定只确认其处置结论。
 - 缺少决定等同于未批准，不得默认通过。
 - `note` 可记录用户说明，但不能作为修改 operation 的隐式命令；内容变化必须生成新提案和新审核包。
+- `decisions.json` 已存在时拒绝覆盖；如需改变决定，应生成新的审核包，不能原地修改或沿用旧批准。
+
+`decide` 退出码 `0` 表示决定文件成功创建，`2` 表示审核包、草稿或输出校验失败且没有新的决定文件。
 
 ## 审核展示要求
 
