@@ -28,7 +28,7 @@ description: 将 ChatGPT 对话导出 JSON 整理为可审核的知识候选。�
 9. 进入知识库整合阶段前读取 [references/knowledge-base-conventions.md](references/knowledge-base-conventions.md) 和 [references/knowledge-inventory.md](references/knowledge-inventory.md)。知识库根目录必须显式提供；默认把工具仓库与正式知识库视为两个独立根目录。
 10. 运行 `scripts/knowledge_inventory.py inventory <knowledge-root> <new-output-file>`，只读扫描 Markdown 并生成 inventory。输出文件必须尚不存在；存在链接跳过警告时检查清单后再继续。
 11. 需要查找相关知识时读取 [references/knowledge-retrieval.md](references/knowledge-retrieval.md)，运行 `scripts/knowledge_retrieval.py retrieve <knowledge-root> <inventory.json> <knowledge-candidates.json> <new-output-file> [--limit N]`。程序先重新校验知识库哈希，再按字面关键词召回章节；默认每个候选保留最多 20 个结果，结果分数只用于排序，不代表语义相似、知识价值或写入决定。
-12. 需要语义整合时再读取 [references/knowledge-proposals.md](references/knowledge-proposals.md)。Codex 阅读候选、召回章节和必要的 Markdown 原文，生成 `add`、`merge`、`no_change`、`conflict` 或 `defer` 提案；不得仅根据检索分数下结论。
+12. 需要语义整合时再读取 [references/knowledge-proposals.md](references/knowledge-proposals.md)。Codex 阅读候选、召回章节和必要的 Markdown 原文，按 `proposal-draft.v1` 生成 `add`、`merge`、`no_change`、`conflict` 或 `defer` 草稿；不得仅根据检索分数下结论。运行 `scripts/knowledge_proposals.py finalize <knowledge-root> <inventory.json> <knowledge-candidates.json> <knowledge-retrieval.json> <proposal-draft.json> <new-output-file>`，由程序重新校验知识快照和召回结果、保证候选完整覆盖、校验有限操作并生成稳定提案 ID。该步骤不生成 diff，也不修改知识库。
 13. 准备人工审核时读取 [references/review-package.md](references/review-package.md)，由确定性脚本校验提案、目标路径、当前文件哈希和允许的操作，再生成完整 after 文件与准确 diff。提案、after 或 diff 重新生成后，旧批准失效。
 14. 只有用户明确批准具体提案后才能应用变更。应用前读取 [references/apply-manifest.md](references/apply-manifest.md)，重新校验批准绑定、知识库当前哈希和目标路径；只应用获批内容并生成最小审计清单。
 15. 应用完成后只报告知识库 Git 状态和 diff，不自动执行 `git add`、`git commit` 或 `git push`。当前阶段不建立或更新 SQLite、向量数据库或其他持久化索引。
@@ -46,10 +46,10 @@ description: 将 ChatGPT 对话导出 JSON 整理为可审核的知识候选。�
 - `conversation-knowledge-curator.extraction-manifest.v1` 提取清单：记录输入哈希、规则版本、每段对话的处理状态、候选关联和输出哈希。
 - `conversation-knowledge-curator.knowledge-inventory.v1` 知识目录：保存 Markdown 文件、标题、章节定位和内容哈希，不复制正文。
 - `conversation-knowledge-curator.knowledge-retrieval.v2` 召回结果：按可解释的完整词匹配分数列出候选可能相关的 Markdown 章节，不复制正文；v2 将默认结果数由 5 提高到 20，并消除英文子串误匹配。
+- `conversation-knowledge-curator.knowledge-proposals.v1` 知识修改提案：绑定候选、知识快照和召回结果，记录 `add`、`merge`、`no_change`、`conflict` 或 `defer` 判断及受限 Markdown 操作；仍属于待审核建议。
 
 尚未实现的第四阶段契约：
 
-- `conversation-knowledge-curator.knowledge-proposals.v1` 知识修改提案：记录候选到现有知识的语义决策、目标和受限修改操作。
 - `conversation-knowledge-curator.review-manifest.v1` 审核清单：把提案、after 文件和 diff 的身份与哈希绑定到一次审核。
 - `conversation-knowledge-curator.review-decisions.v1` 审核决定：记录用户对具体提案与具体 diff 的批准或拒绝。
 - `conversation-knowledge-curator.apply-manifest.v1` 应用清单：记录实际应用的提案、文件及变更前后哈希。
