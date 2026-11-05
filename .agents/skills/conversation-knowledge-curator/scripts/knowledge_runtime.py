@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""实现 conversation-knowledge-curator.run.v4 的单流程运行核心。"""
+"""实现 conversation-knowledge-curator.run.v6 的单流程运行核心。"""
 
 from __future__ import annotations
 
 import argparse
 import base64
+import bisect
 import hashlib
 import json
 import os
@@ -20,16 +21,20 @@ import knowledge_document_quality
 import knowledge_inventory
 import knowledge_retrieval
 
-FORMAT_VERSION = "conversation-knowledge-curator.run.v4"
-VISIBLE_FORMAT = "conversation-knowledge-curator.visible-input.v1"
+FORMAT_VERSION = "conversation-knowledge-curator.run.v6"
+VISIBLE_FORMAT = "conversation-knowledge-curator.visible-input.v3"
 CONTEXT_FORMAT = "conversation-knowledge-curator.context.v1"
 REVIEW_FORMAT = "conversation-knowledge-curator.review.v3"
-REVIEW_INPUT_FORMAT = "conversation-knowledge-curator.review-input.v1"
+REVIEW_INPUT_FORMAT = "conversation-knowledge-curator.review-input.v2"
 RUN_ID_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 RUN_RELATIVE_ROOT = PurePosixPath(".knowledge-curator/runs")
 PROPOSED_DIRECTORY = "proposed"
 APPLY_STATE_FILE = "apply-state.json"
-DEFAULT_BATCH_TOKEN_BUDGET = 12_000
+SMALL_INPUT_OUTPUT_BUDGET_BYTES = 48_000
+MEDIUM_INPUT_OUTPUT_BUDGET_BYTES = 32_000
+LARGE_INPUT_OUTPUT_BUDGET_BYTES = 24_000
+SMALL_INPUT_MAX_BYTES = 48_000
+MEDIUM_INPUT_MAX_BYTES = 512_000
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 ISSUE_KINDS = {
@@ -227,6 +232,7 @@ def collect_visible_view(
         for conversation in result.document["conversations"]:
             item = dict(conversation)
             item["source_sha256"] = source_sha
+            item["conversation_ref"] = f"c{len(conversations) + 1}"
             source_conversations.append(item)
             conversations.append(item)
         sources.append(
@@ -255,12 +261,6 @@ def collect_visible_view(
     return view, metadata
 
 
-def estimated_tokens(value: object) -> int:
-    """用 UTF-8 字节数作为保守 Token 上界，避免低估混合语言输入。"""
-
-    return max(1, len(serialize_json(value).encode("utf-8")))
-
-
 def message_units(messages: list[dict[str, object]]) -> list[list[dict[str, object]]]:
     """优先把一个 user 消息及其后续 assistant 回复保留在同一处理单元。"""
 
@@ -276,139 +276,492 @@ def message_units(messages: list[dict[str, object]]) -> list[list[dict[str, obje
     return units
 
 
-def conversation_segments(
-    conversation: dict[str, object], token_budget: int
-) -> list[dict[str, object]]:
-    """优先保留完整对话，超预算时按连续消息单元拆分。"""
+def natural_utf8_ranges(text: str, max_part_bytes: int) -> list[tuple[int, int]]:
+    """优先按段落、行和句末拆分文本，并保证 UTF-8 字符不被截断。"""
 
-    messages_value = conversation.get("messages")
-    if not isinstance(messages_value, list) or not all(
-        isinstance(message, dict) for message in messages_value
-    ):
-        raise RunError("标准化对话 messages 必须是对象数组")
-    messages: list[dict[str, object]] = list(messages_value)
-    base = {
-        key: value for key, value in conversation.items() if key != "messages"
+    if max_part_bytes < 1:
+        raise RunError("消息分片字节预算必须是正整数")
+    positions = [0]
+    paragraph_boundaries: list[int] = []
+    line_boundaries: list[int] = []
+    sentence_boundaries: list[int] = []
+    byte_offset = 0
+    for index, character in enumerate(text):
+        byte_offset += len(character.encode("utf-8"))
+        positions.append(byte_offset)
+        if character == "\n":
+            line_boundaries.append(byte_offset)
+            if index > 0 and text[index - 1] == "\n":
+                paragraph_boundaries.append(byte_offset)
+        elif character in "。！？.!?；;":
+            sentence_boundaries.append(byte_offset)
+    total_bytes = positions[-1]
+    if total_bytes == 0:
+        return [(0, 0)]
+
+    def last_within(boundaries: list[int], start: int, limit: int) -> int | None:
+        """返回区间内最后一个边界。"""
+
+        position = bisect.bisect_right(boundaries, limit) - 1
+        if position >= 0 and boundaries[position] > start:
+            return boundaries[position]
+        return None
+
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    while start < total_bytes:
+        limit = min(total_bytes, start + max_part_bytes)
+        end = None
+        for boundaries in (
+            paragraph_boundaries,
+            line_boundaries,
+            sentence_boundaries,
+        ):
+            end = last_within(boundaries, start, limit)
+            if end is not None:
+                break
+        if end is None:
+            position = bisect.bisect_right(positions, limit) - 1
+            if position < 0 or positions[position] <= start:
+                position = bisect.bisect_right(positions, start)
+            if position >= len(positions):
+                raise RunError("无法找到安全的 UTF-8 消息分片边界")
+            end = positions[position]
+        ranges.append((start, end))
+        start = end
+    return ranges
+
+
+def public_part(part: dict[str, object]) -> dict[str, object]:
+    """移除只用于内存编排的来源与对话字段。"""
+
+    return {
+        key: part[key]
+        for key in (
+            "message_id",
+            "part_index",
+            "part_count",
+            "start_byte",
+            "end_byte",
+            "message_sha256",
+        )
     }
 
-    def segment_for(items: list[dict[str, object]]) -> dict[str, object]:
-        view = {**base, "messages": items}
-        return {
-            "source_sha256": str(conversation["source_sha256"]),
-            "conversation_id": str(conversation["conversation_id"]),
-            "message_ids": [str(message["message_id"]) for message in items],
-            "message_count": len(items),
-            "estimated_tokens": estimated_tokens(view),
-        }
 
-    complete = segment_for(messages)
-    if complete["estimated_tokens"] <= token_budget:
-        return [complete]
+def flatten_batch_parts(batch: dict[str, object]) -> list[dict[str, object]]:
+    """把 run 中按对话分组的分片引用恢复为有序内存列表。"""
 
-    segments: list[dict[str, object]] = []
-    pending: list[dict[str, object]] = []
-    for unit in message_units(messages):
-        candidate = segment_for([*pending, *unit])
-        if candidate["estimated_tokens"] <= token_budget:
-            pending.extend(unit)
-            continue
-        if pending:
-            segments.append(segment_for(pending))
-            pending = []
-        unit_segment = segment_for(unit)
-        if unit_segment["estimated_tokens"] <= token_budget:
-            pending.extend(unit)
-            continue
-        for message in unit:
-            message_segment = segment_for([message])
-            if message_segment["estimated_tokens"] > token_budget:
-                raise RunError(
-                    "单条可见消息超过 read-input Token 预算，无法在消息边界安全拆分："
-                    f"{message.get('message_id', '<unknown>')}"
+    flattened: list[dict[str, object]] = []
+    conversations = batch.get("conversations")
+    if not isinstance(conversations, list):
+        raise RunError("批次 conversations 必须是数组")
+    for reference in conversations:
+        if not isinstance(reference, dict) or not isinstance(
+            reference.get("parts"), list
+        ):
+            raise RunError("批次对话分片引用无效")
+        for part in reference["parts"]:
+            if not isinstance(part, dict):
+                raise RunError("批次消息分片引用无效")
+            flattened.append(
+                {
+                    "source_sha256": reference["source_sha256"],
+                    "conversation_id": reference["conversation_id"],
+                    **part,
+                }
+            )
+    return flattened
+
+
+def render_batch_view(
+    view: dict[str, object],
+    parts: list[dict[str, object]],
+    batch_index: int,
+    batch_count: int,
+) -> dict[str, object]:
+    """从原始可见视图按字节偏移动态重建一个只读批次。"""
+
+    parts_by_message: dict[tuple[str, str, str], list[dict[str, object]]] = {}
+    for part in parts:
+        key = (
+            str(part["source_sha256"]),
+            str(part["conversation_id"]),
+            str(part["message_id"]),
+        )
+        parts_by_message.setdefault(key, []).append(part)
+
+    selected_conversations: list[dict[str, object]] = []
+    sources = view.get("sources")
+    if not isinstance(sources, list):
+        raise RunError("可见消息视图 sources 必须是数组")
+    for source_item in sources:
+        if not isinstance(source_item, dict):
+            raise RunError("可见消息来源必须是对象")
+        conversations = source_item.get("conversations")
+        if not isinstance(conversations, list):
+            raise RunError("可见消息来源 conversations 必须是数组")
+        for conversation in conversations:
+            if not isinstance(conversation, dict):
+                raise RunError("可见对话必须是对象")
+            source_sha256 = str(conversation.get("source_sha256", ""))
+            conversation_id = str(conversation.get("conversation_id", ""))
+            conversation_ref = str(conversation.get("conversation_ref", ""))
+            if not conversation_ref:
+                raise RunError("可见对话缺少 conversation_ref")
+            selected_messages: list[dict[str, object]] = []
+            messages = conversation.get("messages")
+            if not isinstance(messages, list):
+                raise RunError("可见对话 messages 必须是数组")
+            for message in messages:
+                if not isinstance(message, dict):
+                    raise RunError("可见消息必须是对象")
+                message_id = str(message.get("message_id", ""))
+                key = (source_sha256, conversation_id, message_id)
+                message_parts = parts_by_message.pop(key, [])
+                if not message_parts:
+                    continue
+                text = message.get("text")
+                if not isinstance(text, str):
+                    raise RunError(f"可见消息缺少文本：{message_id}")
+                raw_text = text.encode("utf-8")
+                message_sha256 = sha256_bytes(raw_text)
+                for part in message_parts:
+                    if part["message_sha256"] != message_sha256:
+                        raise RunError(f"消息分片 Hash 不一致：{message_id}")
+                    start_byte = int(part["start_byte"])
+                    end_byte = int(part["end_byte"])
+                    if not 0 <= start_byte < end_byte <= len(raw_text):
+                        raise RunError(f"消息分片字节范围越界：{message_id}")
+                    try:
+                        fragment_text = raw_text[start_byte:end_byte].decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise RunError(
+                            f"消息分片破坏 UTF-8 字符边界：{message_id}"
+                        ) from exc
+                    selected_message = {
+                        "message_id": message_id,
+                        "role": message.get("role"),
+                        "text": fragment_text,
+                    }
+                    if int(part["part_count"]) > 1:
+                        selected_message["fragment"] = {
+                            key_name: part[key_name]
+                            for key_name in (
+                                "part_index",
+                                "part_count",
+                            )
+                        }
+                    selected_messages.append(selected_message)
+            if selected_messages:
+                selected_conversations.append(
+                    {
+                        "conversation_ref": conversation_ref,
+                        "conversation_id": conversation_id,
+                        "title": conversation.get("title"),
+                        "messages": selected_messages,
+                    }
                 )
-            segments.append(message_segment)
-    if pending:
-        segments.append(segment_for(pending))
-    return segments
+    if parts_by_message:
+        raise RunError("批次引用了不存在的可见消息")
+    result: dict[str, object] = {
+        "format": VISIBLE_FORMAT,
+        "batch": batch_index,
+        "batch_count": batch_count,
+        "output_bytes": 0,
+        "conversations": selected_conversations,
+    }
+    for _ in range(8):
+        output_bytes = len(serialize_json(result).encode("utf-8"))
+        if result["output_bytes"] == output_bytes:
+            return result
+        result["output_bytes"] = output_bytes
+    raise RunError("无法稳定计算 read-input 输出字节数")
+
+
+def split_message_parts(
+    view: dict[str, object],
+    source_sha256: str,
+    conversation_id: str,
+    message: dict[str, object],
+    max_output_bytes: int,
+) -> list[dict[str, object]]:
+    """为单条消息规划不落盘的分片，直到每片能独立安全输出。"""
+
+    message_id = message.get("message_id")
+    text = message.get("text")
+    if not isinstance(message_id, str) or not message_id or not isinstance(text, str):
+        raise RunError("可见消息缺少有效 message_id 或 text")
+    raw_text = text.encode("utf-8")
+    if not raw_text:
+        raise RunError(f"可见消息文本不能为空：{message_id}")
+    raw_limit = max_output_bytes
+    message_sha256 = sha256_bytes(raw_text)
+    while True:
+        ranges = natural_utf8_ranges(text, raw_limit)
+        part_count = len(ranges)
+        parts = [
+            {
+                "source_sha256": source_sha256,
+                "conversation_id": conversation_id,
+                "message_id": message_id,
+                "part_index": index,
+                "part_count": part_count,
+                "start_byte": start_byte,
+                "end_byte": end_byte,
+                "message_sha256": message_sha256,
+            }
+            for index, (start_byte, end_byte) in enumerate(ranges, start=1)
+        ]
+        if all(
+            render_batch_view(
+                view,
+                [part],
+                999_999_999_999,
+                999_999_999_999,
+            )["output_bytes"]
+            <= max_output_bytes
+            for part in parts
+        ):
+            return parts
+        if raw_limit == 1:
+            raise RunError(
+                "read-input 固定元数据超过输出预算，无法安全返回消息："
+                f"{message_id}"
+            )
+        raw_limit = max(1, raw_limit // 2)
+
+
+def batch_manifest(
+    parts: list[dict[str, object]],
+    index: int,
+    output_bytes: int,
+) -> dict[str, object]:
+    """把有序消息分片转换为不含正文的 run 批次记录。"""
+
+    references: list[dict[str, object]] = []
+    reference_map: dict[tuple[str, str], dict[str, object]] = {}
+    for part in parts:
+        key = (str(part["source_sha256"]), str(part["conversation_id"]))
+        reference = reference_map.get(key)
+        if reference is None:
+            reference = {
+                "source_sha256": key[0],
+                "conversation_id": key[1],
+                "message_count": 0,
+                "part_count": 0,
+                "parts": [],
+            }
+            reference_map[key] = reference
+            references.append(reference)
+        reference_parts = reference["parts"]
+        assert isinstance(reference_parts, list)
+        reference_parts.append(public_part(part))
+        reference["part_count"] = len(reference_parts)
+        reference["message_count"] = len(
+            {str(item["message_id"]) for item in reference_parts}
+        )
+    return {
+        "index": index,
+        "conversation_count": len(references),
+        "message_count": len(
+            {
+                (
+                    str(part["source_sha256"]),
+                    str(part["conversation_id"]),
+                    str(part["message_id"]),
+                )
+                for part in parts
+            }
+        ),
+        "part_count": len(parts),
+        "output_bytes": output_bytes,
+        "conversations": references,
+    }
+
+
+def estimate_visible_input_bytes(view: dict[str, object]) -> int:
+    """估算精简可见视图体积，只用于选择默认读取预算档位。"""
+
+    total = 256
+    sources = view.get("sources")
+    if not isinstance(sources, list):
+        raise RunError("可见消息视图 sources 必须是数组")
+    for source_item in sources:
+        if not isinstance(source_item, dict):
+            raise RunError("可见消息来源必须是对象")
+        conversations = source_item.get("conversations")
+        if not isinstance(conversations, list):
+            raise RunError("可见消息来源 conversations 必须是数组")
+        for conversation in conversations:
+            if not isinstance(conversation, dict):
+                raise RunError("可见对话必须是对象")
+            total += len(str(conversation.get("conversation_ref", "")).encode("utf-8"))
+            total += len(str(conversation.get("conversation_id", "")).encode("utf-8"))
+            total += len(str(conversation.get("title", "")).encode("utf-8")) + 128
+            messages = conversation.get("messages")
+            if not isinstance(messages, list):
+                raise RunError("可见对话 messages 必须是数组")
+            for message in messages:
+                if not isinstance(message, dict):
+                    raise RunError("可见消息必须是对象")
+                total += len(str(message.get("message_id", "")).encode("utf-8"))
+                total += len(str(message.get("role", "")).encode("utf-8"))
+                total += len(str(message.get("text", "")).encode("utf-8")) + 96
+    return total
+
+
+def choose_read_output_budget(view: dict[str, object]) -> int:
+    """按输入规模选择兼顾一次读取和单次输出安全的默认预算。"""
+
+    estimated_bytes = estimate_visible_input_bytes(view)
+    if estimated_bytes <= SMALL_INPUT_MAX_BYTES:
+        return SMALL_INPUT_OUTPUT_BUDGET_BYTES
+    if estimated_bytes <= MEDIUM_INPUT_MAX_BYTES:
+        return MEDIUM_INPUT_OUTPUT_BUDGET_BYTES
+    return LARGE_INPUT_OUTPUT_BUDGET_BYTES
 
 
 def build_batches(
-    conversations: list[dict[str, object]],
-    token_budget: int = DEFAULT_BATCH_TOKEN_BUDGET,
+    view: dict[str, object],
+    max_output_bytes: int | None = None,
 ) -> list[dict[str, object]]:
-    """按保守 Token 预算构造批次，单个大对话按消息边界拆分。"""
+    """按实际序列化输出预算分批，并为超长单条消息规划虚拟分片。"""
 
-    if token_budget < 1:
-        raise RunError("Token 预算必须是正整数")
-    segments = [
-        segment
-        for conversation in conversations
-        for segment in conversation_segments(conversation, token_budget)
-    ]
-    batches: list[dict[str, object]] = []
-    current: list[dict[str, object]] = []
-    current_tokens = 0
-    for segment in segments:
-        segment_tokens = int(segment["estimated_tokens"])
-        if current and current_tokens + segment_tokens > token_budget:
-            batches.append(
-                {
-                    "index": len(batches) + 1,
-                    "conversation_count": len(
-                        {
-                            (
-                                str(item["source_sha256"]),
-                                str(item["conversation_id"]),
-                            )
-                            for item in current
-                        }
-                    ),
-                    "message_count": sum(int(item["message_count"]) for item in current),
-                    "estimated_tokens": current_tokens,
-                    "conversations": current,
-                }
+    if max_output_bytes is None:
+        max_output_bytes = choose_read_output_budget(view)
+    if type(max_output_bytes) is not int or max_output_bytes < 1:
+        raise RunError("read-input 输出字节预算必须是正整数")
+    sources = view.get("sources")
+    if not isinstance(sources, list):
+        raise RunError("可见消息视图 sources 必须是数组")
+    conversation_groups: list[
+        tuple[list[dict[str, object]], list[list[dict[str, object]]]]
+    ] = []
+    for source_item in sources:
+        if not isinstance(source_item, dict) or not isinstance(
+            source_item.get("conversations"), list
+        ):
+            raise RunError("可见消息来源结构无效")
+        for conversation in source_item["conversations"]:
+            if not isinstance(conversation, dict):
+                raise RunError("可见对话必须是对象")
+            source_sha256 = str(conversation.get("source_sha256", ""))
+            conversation_id = str(conversation.get("conversation_id", ""))
+            messages = conversation.get("messages")
+            if not source_sha256 or not conversation_id or not isinstance(
+                messages, list
+            ) or not all(isinstance(message, dict) for message in messages):
+                raise RunError("可见对话来源、ID 或 messages 无效")
+            parts_by_message: dict[str, list[dict[str, object]]] = {}
+            for message in messages:
+                message_id = str(message.get("message_id", ""))
+                parts_by_message[message_id] = split_message_parts(
+                    view,
+                    source_sha256,
+                    conversation_id,
+                    message,
+                    max_output_bytes,
+                )
+            unit_groups = [
+                [
+                    part
+                    for message in unit
+                    for part in parts_by_message[str(message["message_id"])]
+                ]
+                for unit in message_units(list(messages))
+            ]
+            conversation_groups.append(
+                ([part for group in unit_groups for part in group], unit_groups)
             )
-            current = []
-            current_tokens = 0
-        current.append(segment)
-        current_tokens += segment_tokens
-    if current:
-        batches.append(
-            {
-                "index": len(batches) + 1,
-                "conversation_count": len(
-                    {
-                        (
-                            str(item["source_sha256"]),
-                            str(item["conversation_id"]),
-                        )
-                        for item in current
-                    }
-                ),
-                "message_count": sum(int(item["message_count"]) for item in current),
-                "estimated_tokens": current_tokens,
-                "conversations": current,
-            }
+
+    conservative_index = 999_999_999_999
+
+    def fits(parts: list[dict[str, object]]) -> bool:
+        """用保守批次位数判断候选输出是否落在预算内。"""
+
+        return (
+            render_batch_view(
+                view,
+                parts,
+                conservative_index,
+                conservative_index,
+            )["output_bytes"]
+            <= max_output_bytes
         )
+
+    part_batches: list[list[dict[str, object]]] = []
+    current: list[dict[str, object]] = []
+
+    def flush() -> None:
+        """保存当前批次并清空缓冲。"""
+
+        nonlocal current
+        if current:
+            part_batches.append(current)
+            current = []
+
+    def pack_group(group: list[dict[str, object]]) -> None:
+        """尽量完整保留消息单元，必要时才退到逐分片装箱。"""
+
+        nonlocal current
+        if fits([*current, *group]):
+            current.extend(group)
+            return
+        flush()
+        if fits(group):
+            current.extend(group)
+            return
+        for part in group:
+            if fits([*current, part]):
+                current.append(part)
+                continue
+            flush()
+            if not fits([part]):
+                raise RunError("单个消息分片仍超过 read-input 输出字节预算")
+            current.append(part)
+
+    for conversation_parts, unit_groups in conversation_groups:
+        if fits([*current, *conversation_parts]):
+            current.extend(conversation_parts)
+            continue
+        flush()
+        if fits(conversation_parts):
+            current.extend(conversation_parts)
+            continue
+        for group in unit_groups:
+            pack_group(group)
+    flush()
+
+    batch_count = len(part_batches)
+    batches: list[dict[str, object]] = []
+    for index, parts in enumerate(part_batches, start=1):
+        output = render_batch_view(view, parts, index, batch_count)
+        output_bytes = int(output["output_bytes"])
+        if output_bytes > max_output_bytes:
+            raise RunError("read-input 批次输出超过字节预算")
+        batches.append(batch_manifest(parts, index, output_bytes))
     return batches
 
 
 def available_source_index(
     conversations: list[dict[str, object]],
-) -> dict[tuple[str, str], set[str]]:
-    """构造可见来源索引，供审核元数据验证真实消息引用。"""
+) -> dict[str, dict[str, object]]:
+    """按精简对话引用构造来源索引，供审核时恢复完整来源。"""
 
-    index: dict[tuple[str, str], set[str]] = {}
+    index: dict[str, dict[str, object]] = {}
     for conversation in conversations:
-        key = (
-            str(conversation["source_sha256"]),
-            str(conversation["conversation_id"]),
-        )
+        conversation_ref = str(conversation.get("conversation_ref", ""))
+        if not conversation_ref or conversation_ref in index:
+            raise RunError("可见对话 conversation_ref 缺失或重复")
         messages = conversation.get("messages", [])
-        index[key] = {
-            str(message["message_id"])
-            for message in messages
-            if isinstance(message, dict) and "message_id" in message
+        index[conversation_ref] = {
+            "source_sha256": str(conversation["source_sha256"]),
+            "conversation_id": str(conversation["conversation_id"]),
+            "message_ids": {
+                str(message["message_id"])
+                for message in messages
+                if isinstance(message, dict) and "message_id" in message
+            },
         }
     return index
 
@@ -454,24 +807,21 @@ def parse_review_input(
         if not isinstance(sources, list) or not sources:
             raise RunError(f"{context}.sources 必须是非空数组")
         normalized_sources: list[dict[str, object]] = []
-        seen_sources: set[tuple[str, str]] = set()
+        seen_sources: set[str] = set()
         for source_index, source in enumerate(sources):
             source_context = f"{context}.sources[{source_index}]"
             if not isinstance(source, dict):
                 raise RunError(f"{source_context} 必须是对象")
             require_exact_fields(
                 source,
-                {"source_sha256", "conversation_id", "message_ids"},
+                {"conversation_ref", "message_ids"},
                 f"{source_context} ",
             )
-            source_sha = source["source_sha256"]
-            conversation_id = source["conversation_id"]
+            conversation_ref = source["conversation_ref"]
             message_ids = source["message_ids"]
             if (
-                not isinstance(source_sha, str)
-                or not SHA256_PATTERN.fullmatch(source_sha)
-                or not isinstance(conversation_id, str)
-                or not conversation_id
+                not isinstance(conversation_ref, str)
+                or not conversation_ref
                 or not isinstance(message_ids, list)
                 or not message_ids
                 or not all(
@@ -480,23 +830,25 @@ def parse_review_input(
                 )
             ):
                 raise RunError(f"{source_context} 字段类型或取值无效")
-            key = (source_sha, conversation_id)
-            if key in seen_sources:
+            if conversation_ref in seen_sources:
                 raise RunError(f"{source_context} 重复登记同一对话")
-            if key not in available:
-                raise RunError(f"{source_context} 引用了未知来源或对话")
+            if conversation_ref not in available:
+                raise RunError(f"{source_context} 引用了未知 conversation_ref")
             if len(set(message_ids)) != len(message_ids):
                 raise RunError(f"{source_context}.message_ids 不得重复")
-            unknown_messages = sorted(set(message_ids) - available[key])
+            available_source = available[conversation_ref]
+            available_messages = available_source["message_ids"]
+            assert isinstance(available_messages, set)
+            unknown_messages = sorted(set(message_ids) - available_messages)
             if unknown_messages:
                 raise RunError(
                     f"{source_context} 引用了未知可见消息：{unknown_messages}"
                 )
-            seen_sources.add(key)
+            seen_sources.add(conversation_ref)
             normalized_sources.append(
                 {
-                    "source_sha256": source_sha,
-                    "conversation_id": conversation_id,
+                    "source_sha256": available_source["source_sha256"],
+                    "conversation_id": available_source["conversation_id"],
                     "message_ids": list(message_ids),
                 }
             )
@@ -564,9 +916,10 @@ def initialize_run(
         source = input_path.resolve(strict=True)
     except OSError as exc:
         raise RunError(f"输入路径不存在或不可访问：{input_path}") from exc
-    _, metadata = collect_visible_view(source, branch)
+    view, metadata = collect_visible_view(source, branch)
     inventory, snapshot_sha = inventory_snapshot(root)
-    batches = build_batches(metadata["conversations"])
+    read_output_budget = choose_read_output_budget(view)
+    batches = build_batches(view, read_output_budget)
     if not batches:
         raise RunError("输入中没有可用于知识整理的可见 user/assistant 消息")
     run_root = expected_run_root(root, normalized_id)
@@ -595,6 +948,7 @@ def initialize_run(
             "conversation_count": metadata["conversation_count"],
             "message_count": metadata["message_count"],
             "warnings": metadata["warnings"],
+            "read_output_budget_bytes": read_output_budget,
             "batches": batches,
         },
         "knowledge_base": {
@@ -623,7 +977,7 @@ def initialize_run(
 
 
 def validate_run_document(document: object) -> dict[str, object]:
-    """严格校验 run.v4 顶层和关键子结构。"""
+    """严格校验 run.v6 顶层和关键子结构。"""
 
     if not isinstance(document, dict):
         raise RunError("run.json 顶层必须是对象")
@@ -636,7 +990,7 @@ def validate_run_document(document: object) -> dict[str, object]:
         "run.json ",
     )
     if document["format"] != FORMAT_VERSION:
-        raise RunError("仅支持 conversation-knowledge-curator.run.v4")
+        raise RunError("仅支持 conversation-knowledge-curator.run.v6")
     validate_run_id(document["run_id"])
     if (
         not isinstance(document["status"], str)
@@ -665,7 +1019,13 @@ def validate_run_document(document: object) -> dict[str, object]:
     )
     require_exact_fields(
         parsing,
-        {"conversation_count", "message_count", "warnings", "batches"},
+        {
+            "conversation_count",
+            "message_count",
+            "warnings",
+            "read_output_budget_bytes",
+            "batches",
+        },
         "run.json.parsing ",
     )
     require_exact_fields(
@@ -731,12 +1091,20 @@ def validate_run_document(document: object) -> dict[str, object]:
         or type(parsing["message_count"]) is not int
         or parsing["message_count"] < 1
         or not isinstance(parsing["warnings"], list)
+        or parsing["read_output_budget_bytes"]
+        not in {
+            SMALL_INPUT_OUTPUT_BUDGET_BYTES,
+            MEDIUM_INPUT_OUTPUT_BUDGET_BYTES,
+            LARGE_INPUT_OUTPUT_BUDGET_BYTES,
+        }
         or not isinstance(parsing["batches"], list)
         or not parsing["batches"]
     ):
-        raise RunError("run.json.parsing 字段类型无效")
+        raise RunError("run.json.parsing 字段类型或取值无效")
     seen_conversations: set[tuple[str, str]] = set()
-    seen_messages: set[tuple[str, str, str]] = set()
+    message_parts: dict[
+        tuple[str, str, str], list[dict[str, object]]
+    ] = {}
     for batch_index, batch in enumerate(parsing["batches"]):
         context = f"run.json.parsing.batches[{batch_index}]"
         if not isinstance(batch, dict):
@@ -744,8 +1112,12 @@ def validate_run_document(document: object) -> dict[str, object]:
         require_exact_fields(
             batch,
             {
-                "index", "conversation_count", "message_count",
-                "estimated_tokens", "conversations",
+                "index",
+                "conversation_count",
+                "message_count",
+                "part_count",
+                "output_bytes",
+                "conversations",
             },
             f"{context} ",
         )
@@ -753,18 +1125,23 @@ def validate_run_document(document: object) -> dict[str, object]:
             not all(
                 type(batch[name]) is int and batch[name] >= 0
                 for name in (
-                    "index", "conversation_count", "message_count",
-                    "estimated_tokens",
+                    "index",
+                    "conversation_count",
+                    "message_count",
+                    "part_count",
+                    "output_bytes",
                 )
             )
             or not isinstance(batch["conversations"], list)
             or batch["index"] != batch_index + 1
-            or not 1 <= batch["estimated_tokens"] <= DEFAULT_BATCH_TOKEN_BUDGET
+            or not 1
+            <= batch["output_bytes"]
+            <= parsing["read_output_budget_bytes"]
         ):
-            raise RunError(f"{context} 字段类型无效")
+            raise RunError(f"{context} 字段类型或取值无效")
         batch_conversations: set[tuple[str, str]] = set()
-        batch_message_count = 0
-        batch_estimated_tokens = 0
+        batch_messages: set[tuple[str, str, str]] = set()
+        batch_part_count = 0
         for ref_index, ref in enumerate(batch["conversations"]):
             ref_context = f"{context}.conversations[{ref_index}]"
             if not isinstance(ref, dict):
@@ -772,8 +1149,11 @@ def validate_run_document(document: object) -> dict[str, object]:
             require_exact_fields(
                 ref,
                 {
-                    "source_sha256", "conversation_id", "message_ids",
-                    "message_count", "estimated_tokens",
+                    "source_sha256",
+                    "conversation_id",
+                    "message_count",
+                    "part_count",
+                    "parts",
                 },
                 f"{ref_context} ",
             )
@@ -782,41 +1162,95 @@ def validate_run_document(document: object) -> dict[str, object]:
                 or not SHA256_PATTERN.fullmatch(ref["source_sha256"])
                 or not isinstance(ref["conversation_id"], str)
                 or not ref["conversation_id"]
-                or not isinstance(ref["message_ids"], list)
-                or not ref["message_ids"]
-                or not all(
-                    isinstance(message_id, str) and message_id
-                    for message_id in ref["message_ids"]
-                )
-                or len(set(ref["message_ids"])) != len(ref["message_ids"])
-                or ref["message_count"] != len(ref["message_ids"])
-                or type(ref["estimated_tokens"]) is not int
-                or not 1 <= ref["estimated_tokens"] <= DEFAULT_BATCH_TOKEN_BUDGET
+                or type(ref["message_count"]) is not int
+                or ref["message_count"] < 1
+                or type(ref["part_count"]) is not int
+                or ref["part_count"] < 1
+                or not isinstance(ref["parts"], list)
+                or not ref["parts"]
             ):
                 raise RunError(f"{ref_context} 字段类型或取值无效")
             conversation_key = (
-                str(ref["source_sha256"]), str(ref["conversation_id"])
+                str(ref["source_sha256"]),
+                str(ref["conversation_id"]),
             )
+            if conversation_key in batch_conversations:
+                raise RunError(f"{ref_context} 重复引用同一对话")
             batch_conversations.add(conversation_key)
             seen_conversations.add(conversation_key)
-            for message_id in ref["message_ids"]:
-                message_key = (*conversation_key, str(message_id))
-                if message_key in seen_messages:
-                    raise RunError(f"{ref_context} 重复引用可见消息：{message_id}")
-                seen_messages.add(message_key)
-            batch_message_count += int(ref["message_count"])
-            batch_estimated_tokens += int(ref["estimated_tokens"])
+            ref_messages: set[tuple[str, str, str]] = set()
+            for part_index, part in enumerate(ref["parts"]):
+                part_context = f"{ref_context}.parts[{part_index}]"
+                if not isinstance(part, dict):
+                    raise RunError(f"{part_context} 必须是对象")
+                require_exact_fields(
+                    part,
+                    {
+                        "message_id",
+                        "part_index",
+                        "part_count",
+                        "start_byte",
+                        "end_byte",
+                        "message_sha256",
+                    },
+                    f"{part_context} ",
+                )
+                if (
+                    not isinstance(part["message_id"], str)
+                    or not part["message_id"]
+                    or type(part["part_index"]) is not int
+                    or type(part["part_count"]) is not int
+                    or not 1 <= part["part_index"] <= part["part_count"]
+                    or type(part["start_byte"]) is not int
+                    or type(part["end_byte"]) is not int
+                    or not 0 <= part["start_byte"] < part["end_byte"]
+                    or not isinstance(part["message_sha256"], str)
+                    or not SHA256_PATTERN.fullmatch(part["message_sha256"])
+                ):
+                    raise RunError(f"{part_context} 字段类型或取值无效")
+                message_key = (*conversation_key, str(part["message_id"]))
+                message_parts.setdefault(message_key, []).append(part)
+                ref_messages.add(message_key)
+                batch_messages.add(message_key)
+                batch_part_count += 1
+            if (
+                ref["message_count"] != len(ref_messages)
+                or ref["part_count"] != len(ref["parts"])
+            ):
+                raise RunError(f"{ref_context} 汇总计数与消息分片不一致")
         if (
             batch["conversation_count"] != len(batch_conversations)
-            or batch["message_count"] != batch_message_count
-            or batch["estimated_tokens"] != batch_estimated_tokens
+            or batch["message_count"] != len(batch_messages)
+            or batch["part_count"] != batch_part_count
         ):
-            raise RunError(f"{context} 汇总计数与对话引用不一致")
+            raise RunError(f"{context} 汇总计数与消息分片不一致")
+    for message_key, parts in message_parts.items():
+        expected_count = int(parts[0]["part_count"])
+        expected_hash = str(parts[0]["message_sha256"])
+        if (
+            len(parts) != expected_count
+            or [int(part["part_index"]) for part in parts]
+            != list(range(1, expected_count + 1))
+            or any(
+                part["part_count"] != expected_count
+                or part["message_sha256"] != expected_hash
+                for part in parts
+            )
+            or int(parts[0]["start_byte"]) != 0
+            or any(
+                int(previous["end_byte"]) != int(current["start_byte"])
+                for previous, current in zip(parts, parts[1:], strict=False)
+            )
+        ):
+            raise RunError(
+                "run.json 消息分片缺失、重复、乱序或不连续："
+                f"{message_key[2]}"
+            )
     if (
         parsing["conversation_count"] != len(seen_conversations)
-        or parsing["message_count"] != len(seen_messages)
+        or parsing["message_count"] != len(message_parts)
     ):
-        raise RunError("run.json.parsing 汇总计数与批次引用不一致")
+        raise RunError("run.json.parsing 汇总计数与消息分片不一致")
     if (
         not isinstance(knowledge_base["empty"], bool)
         or not isinstance(knowledge_base["snapshot_sha256"], str)
@@ -965,13 +1399,22 @@ def current_view(
         or metadata["sources"] != input_value.get("sources")
     ):
         raise RunError("原始输入内容已变化，请创建新的 run")
+    parsing = document.get("parsing")
+    if not isinstance(parsing, dict):
+        raise RunError("run.json.parsing 必须是对象")
+    planned_batches = build_batches(
+        view,
+        int(parsing["read_output_budget_bytes"]),
+    )
+    if planned_batches != parsing.get("batches"):
+        raise RunError("run.json 批次或消息分片计划与原始输入不一致")
     return view, metadata
 
 
 def select_batch(
     view: dict[str, object], document: dict[str, object], batch_index: int | None
 ) -> dict[str, object]:
-    """按消息引用返回预算内批次；多批输入禁止一次读取全部内容。"""
+    """按分片引用返回预算内批次；多批输入禁止一次读取全部内容。"""
 
     parsing = document["parsing"]
     assert isinstance(parsing, dict)
@@ -986,45 +1429,18 @@ def select_batch(
         raise RunError("batch 超出可用范围")
     batch = batches[batch_index - 1]
     assert isinstance(batch, dict)
-    refs: dict[tuple[str, str], set[str]] = {}
-    for item in batch["conversations"]:
-        if not isinstance(item, dict) or not isinstance(item.get("message_ids"), list):
-            raise RunError("批次对话引用无效")
-        key = (str(item["source_sha256"]), str(item["conversation_id"]))
-        refs.setdefault(key, set()).update(str(value) for value in item["message_ids"])
-    selected_sources: list[dict[str, object]] = []
-    for source_item in view["sources"]:
-        assert isinstance(source_item, dict)
-        conversations: list[dict[str, object]] = []
-        for conversation in source_item["conversations"]:
-            key = (
-                str(conversation["source_sha256"]),
-                str(conversation["conversation_id"]),
-            )
-            if key not in refs:
-                continue
-            selected_ids = refs[key]
-            selected_messages = [
-                message
-                for message in conversation["messages"]
-                if str(message["message_id"]) in selected_ids
-            ]
-            if selected_messages:
-                conversations.append(
-                    {**conversation, "messages": selected_messages}
-                )
-        if conversations:
-            selected_sources.append(
-                {"source": source_item["source"], "conversations": conversations}
-            )
-    return {
-        "format": VISIBLE_FORMAT,
-        "branch_policy": view["branch_policy"],
-        "batch": batch_index,
-        "batch_count": len(batches),
-        "estimated_tokens": batch["estimated_tokens"],
-        "sources": selected_sources,
-    }
+    result = render_batch_view(
+        view,
+        flatten_batch_parts(batch),
+        batch_index,
+        len(batches),
+    )
+    if result["output_bytes"] != batch.get("output_bytes"):
+        raise RunError("read-input 实际输出大小与 run.json 批次记录不一致")
+    budget = parsing.get("read_output_budget_bytes")
+    if type(budget) is not int or int(result["output_bytes"]) > budget:
+        raise RunError("read-input 实际输出超过字节预算")
+    return result
 
 
 def ensure_snapshot(
@@ -1528,7 +1944,7 @@ def recover_apply(
 
 
 def execute_command(args: argparse.Namespace) -> tuple[dict[str, object], int]:
-    """执行一个 v2 命令并返回结构化结果。"""
+    """执行一个 run.v6 命令并返回结构化结果。"""
 
     if args.command == "init":
         run_root, document = initialize_run(
@@ -1576,7 +1992,7 @@ def create_parser() -> argparse.ArgumentParser:
     """创建唯一公开运行 CLI。"""
 
     parser = argparse.ArgumentParser(
-        description="以单一 run.v4 流程整理 ChatGPT 对话知识。"
+        description="以单一 run.v6 流程整理 ChatGPT 对话知识。"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     init_parser = subparsers.add_parser("init", help="检查输入并创建 run")

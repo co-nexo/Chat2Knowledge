@@ -1,16 +1,18 @@
-"""单流程 run.v4 的行为与安全边界测试。
+"""单流程运行时的行为与安全边界测试。
 
 已覆盖的初始化与读取行为：
 
 1. 初始化只创建 run.json 和 proposed，不持久化 normalized、候选或检索结果。
-2. run.json 使用 v4，保存逐来源清单、解析批次和知识库快照，不复制对话正文。
+2. run.json 使用 v6，保存逐来源清单、无正文分片和知识库快照，不复制对话正文。
 3. read-input 每次从原始 JSON 动态重建可见消息，并拒绝变化后的输入。
 4. 空知识库的 context 明确跳过检索。
 5. 非空知识库的 context 返回有限相关原文，但不保存 inventory 或 retrieval 文件。
 6. 单个 JSON、ZIP 和来源目录都汇入同一个 Run，不形成第二套流程。
-7. 大对话按保守 Token 预算和连续消息边界拆分，多批输入禁止一次读取全部。
-8. 批次引用的重复消息和不一致汇总会被 run 契约校验拒绝。
-9. 重复内容来源保留审计记录但只处理一次，来源清单篡改会被拒绝。
+7. 大对话按实际输出字节预算和连续消息边界拆分，多批输入禁止一次读取全部。
+8. 超长单条消息在内存中按自然边界或 Unicode 安全边界分片，能够无损重组。
+9. 批次引用的重复、缺失或乱序分片会被 run 契约校验拒绝。
+10. 重复内容来源保留审计记录但只处理一次，来源清单篡改会被拒绝。
+11. 小输入一次返回，较大输入按规模选择预算；可见输出不重复暴露路径和 Hash。
 
 已覆盖的审核与应用行为：
 
@@ -82,15 +84,14 @@ def review_metadata(
     _, metadata = runtime.current_view(source, document)
     conversation = metadata["conversations"][0]
     source_ref = {
-        "source_sha256": conversation["source_sha256"],
-        "conversation_id": conversation["conversation_id"],
+        "conversation_ref": conversation["conversation_ref"],
         "message_ids": [
             message["message_id"] for message in conversation["messages"]
         ],
     }
     return json.dumps(
         {
-            "format": "conversation-knowledge-curator.review-input.v1",
+            "format": "conversation-knowledge-curator.review-input.v2",
             "outputs": [
                 {"target_path": path, "sources": [source_ref]}
                 for path in target_paths
@@ -101,7 +102,7 @@ def review_metadata(
     )
 
 
-class RuntimeV4Tests(unittest.TestCase):
+class RuntimeTests(unittest.TestCase):
     def run_cli(
         self,
         argv: list[str],
@@ -126,7 +127,7 @@ class RuntimeV4Tests(unittest.TestCase):
             knowledge_root, input_path = create_inputs(root)
 
             code, result, stderr = self.run_cli(
-                ["init", str(knowledge_root), str(input_path), "runtime-v4"]
+                ["init", str(knowledge_root), str(input_path), "runtime-v6"]
             )
 
             self.assertEqual(code, 0, stderr)
@@ -136,7 +137,7 @@ class RuntimeV4Tests(unittest.TestCase):
                 ["proposed", "run.json"],
             )
             run = json.loads((run_root / "run.json").read_text(encoding="utf-8"))
-            self.assertEqual(run["format"], "conversation-knowledge-curator.run.v4")
+            self.assertEqual(run["format"], "conversation-knowledge-curator.run.v6")
             self.assertNotIn("conversations", run["parsing"])
             self.assertTrue(run["knowledge_base"]["empty"])
             self.assertEqual(len(run["input"]["sources"]), 1)
@@ -146,15 +147,22 @@ class RuntimeV4Tests(unittest.TestCase):
                 str(input_path.resolve()),
             )
             self.assertIsNone(run["input"]["sources"][0]["member_path"])
+            self.assertEqual(
+                run["parsing"]["read_output_budget_bytes"],
+                runtime.SMALL_INPUT_OUTPUT_BUDGET_BYTES,
+            )
+            self.assertEqual(len(run["parsing"]["batches"]), 1)
 
             read_code, view, read_stderr = self.run_cli(
                 ["read-input", str(run_root)]
             )
             self.assertEqual(read_code, 0, read_stderr)
             self.assertEqual(
-                view["format"], "conversation-knowledge-curator.visible-input.v1"
+                view["format"], "conversation-knowledge-curator.visible-input.v3"
             )
-            self.assertTrue(view["sources"][0]["conversations"])
+            self.assertTrue(view["conversations"])
+            self.assertNotIn("sources", view)
+            self.assertNotIn("source_sha256", view["conversations"][0])
             self.assertFalse(any(run_root.rglob("*normalized*")))
 
             input_path.write_text("[]\n", encoding="utf-8")
@@ -206,7 +214,7 @@ class RuntimeV4Tests(unittest.TestCase):
                 ["read-input", str(run_root)]
             )
             self.assertEqual(read_code, 0, read_stderr)
-            self.assertEqual(len(view["sources"]), 2)
+            self.assertEqual(len(view["conversations"]), 2)
 
             second_root = root / "knowledge-two"
             second_root.mkdir()
@@ -234,7 +242,7 @@ class RuntimeV4Tests(unittest.TestCase):
                 ["read-input", str(directory_run)]
             )
             self.assertEqual(read_code, 0, read_stderr)
-            self.assertEqual(len(directory_view["sources"]), 2)
+            self.assertEqual(len(directory_view["conversations"]), 2)
 
             shutil.copyfile(FIXTURE, input_directory / "later.json")
             changed_code, _, changed_stderr = self.run_cli(
@@ -290,7 +298,53 @@ class RuntimeV4Tests(unittest.TestCase):
             with self.assertRaisesRegex(runtime.RunError, "来源清单不一致"):
                 runtime.load_run(run_root)
 
-    def test_batch_budget_splits_large_conversation_without_message_loss(self) -> None:
+    def test_read_budget_is_selected_from_compact_visible_input_size(self) -> None:
+        def view_with_text(text: str) -> dict[str, object]:
+            """构造只改变正文体积的合成可见输入。"""
+
+            return {
+                "format": "conversation-knowledge-curator.visible-input.v3",
+                "branch_policy": "active",
+                "sources": [
+                    {
+                        "source": {
+                            "kind": "json_file",
+                            "path": "synthetic.json",
+                            "sha256": "a" * 64,
+                        },
+                        "conversations": [
+                            {
+                                "source_sha256": "a" * 64,
+                                "conversation_ref": "c1",
+                                "conversation_id": "conversation-1",
+                                "title": "预算测试",
+                                "messages": [
+                                    {
+                                        "message_id": "message-1",
+                                        "role": "user",
+                                        "text": text,
+                                    }
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+
+        self.assertEqual(
+            runtime.choose_read_output_budget(view_with_text("短文本")),
+            runtime.SMALL_INPUT_OUTPUT_BUDGET_BYTES,
+        )
+        self.assertEqual(
+            runtime.choose_read_output_budget(view_with_text("A" * 60_000)),
+            runtime.MEDIUM_INPUT_OUTPUT_BUDGET_BYTES,
+        )
+        self.assertEqual(
+            runtime.choose_read_output_budget(view_with_text("A" * 600_000)),
+            runtime.LARGE_INPUT_OUTPUT_BUDGET_BYTES,
+        )
+
+    def test_read_output_budget_splits_without_message_loss(self) -> None:
         messages = [
             {
                 "message_id": f"msg-{index}",
@@ -301,22 +355,38 @@ class RuntimeV4Tests(unittest.TestCase):
         ]
         conversation = {
             "source_sha256": "a" * 64,
+            "conversation_ref": "c1",
             "conversation_id": "conversation-1",
             "title": "大对话",
             "messages": messages,
         }
 
-        batches = runtime.build_batches([conversation], token_budget=900)
+        view = {
+            "format": "conversation-knowledge-curator.visible-input.v3",
+            "branch_policy": "active",
+            "sources": [
+                {
+                    "source": {
+                        "kind": "json_file",
+                        "path": "synthetic.json",
+                        "sha256": "a" * 64,
+                    },
+                    "conversations": [conversation],
+                }
+            ],
+        }
+        original_view = json.loads(json.dumps(view, ensure_ascii=False))
+        batches = runtime.build_batches(view, max_output_bytes=1_400)
 
         self.assertGreater(len(batches), 1)
         self.assertTrue(
-            all(batch["estimated_tokens"] <= 900 for batch in batches)
+            all(batch["output_bytes"] <= 1_400 for batch in batches)
         )
         batch_message_sets = [
             {
-                message_id
+                part["message_id"]
                 for ref in batch["conversations"]
-                for message_id in ref["message_ids"]
+                for part in ref["parts"]
             }
             for batch in batches
         ]
@@ -327,42 +397,247 @@ class RuntimeV4Tests(unittest.TestCase):
                     for values in batch_message_sets
                 )
             )
-        view = {
-            "format": "conversation-knowledge-curator.visible-input.v1",
-            "branch_policy": "active",
-            "sources": [
-                {"source": {}, "conversations": [conversation]}
-            ],
+        document = {
+            "parsing": {
+                "read_output_budget_bytes": 1_400,
+                "batches": batches,
+            }
         }
-        document = {"parsing": {"batches": batches}}
         with self.assertRaises(runtime.RunError):
             runtime.select_batch(view, document, None)
         observed: list[str] = []
         for index in range(1, len(batches) + 1):
             selected = runtime.select_batch(view, document, index)
-            self.assertLessEqual(selected["estimated_tokens"], 900)
+            self.assertLessEqual(selected["output_bytes"], 1_400)
+            self.assertEqual(
+                selected["output_bytes"],
+                len(runtime.serialize_json(selected).encode("utf-8")),
+            )
             self.assertEqual(
                 selected,
                 runtime.select_batch(view, document, index),
             )
             observed.extend(
                 message["message_id"]
-                for source in selected["sources"]
-                for item in source["conversations"]
+                for item in selected["conversations"]
                 for message in item["messages"]
             )
         self.assertEqual(observed, [message["message_id"] for message in messages])
-        oversized = {
-            **conversation,
-            "conversation_id": "oversized",
-            "messages": [
-                {"message_id": "huge", "role": "user", "text": "超" * 1000}
-            ],
-        }
-        with self.assertRaises(runtime.RunError):
-            runtime.build_batches([oversized], token_budget=200)
+        self.assertEqual(view, original_view)
 
-    def test_batch_contract_rejects_duplicate_message_reference(self) -> None:
+    def test_oversized_message_is_fragmented_and_reassembled_losslessly(self) -> None:
+        samples = {
+            "chinese": ("第一段中文。\n\n第二段中文。\n\n" * 300),
+            "english": ("First paragraph.\n\nSecond paragraph.\n\n" * 300),
+            "code": (
+                "说明。\n\n```python\n"
+                + "\n".join(f"print({index})" for index in range(500))
+                + "\n```\n\n结论。"
+            ),
+            "single-line": "A" * 10_000,
+            "emoji": "🙂🚀知识片段" * 1000,
+        }
+        for name, text in samples.items():
+            with self.subTest(name=name):
+                message = {
+                    "message_id": f"message-{name}",
+                    "role": "user",
+                    "create_time": None,
+                    "text": text,
+                }
+                conversation = {
+                    "source_sha256": "b" * 64,
+                    "conversation_ref": "c1",
+                    "conversation_id": f"conversation-{name}",
+                    "title": name,
+                    "messages": [message],
+                }
+                view = {
+                    "format": "conversation-knowledge-curator.visible-input.v3",
+                    "branch_policy": "active",
+                    "sources": [
+                        {
+                            "source": {
+                                "kind": "json_file",
+                                "path": f"{name}.json",
+                                "sha256": "b" * 64,
+                            },
+                            "conversations": [conversation],
+                        }
+                    ],
+                }
+                original = json.loads(json.dumps(view, ensure_ascii=False))
+                batches = runtime.build_batches(view, max_output_bytes=1_400)
+                document = {
+                    "parsing": {
+                        "read_output_budget_bytes": 1_400,
+                        "batches": batches,
+                    }
+                }
+                fragments: list[dict[str, object]] = []
+                for index in range(1, len(batches) + 1):
+                    selected = runtime.select_batch(view, document, index)
+                    self.assertLessEqual(selected["output_bytes"], 1_400)
+                    selected_messages = [
+                        selected_message
+                        for selected_conversation in selected["conversations"]
+                        for selected_message in selected_conversation["messages"]
+                    ]
+                    fragments.extend(selected_messages)
+
+                self.assertGreater(len(fragments), 1)
+                self.assertEqual(
+                    "".join(str(fragment["text"]) for fragment in fragments),
+                    text,
+                )
+                self.assertEqual(
+                    [fragment["fragment"]["part_index"] for fragment in fragments],
+                    list(range(1, len(fragments) + 1)),
+                )
+                self.assertTrue(
+                    all(
+                        fragment["fragment"]["part_count"] == len(fragments)
+                        for fragment in fragments
+                    )
+                )
+                self.assertTrue(
+                    all(
+                        set(fragment["fragment"]) == {"part_index", "part_count"}
+                        for fragment in fragments
+                    )
+                )
+                metadata = [
+                    part
+                    for batch in batches
+                    for reference in batch["conversations"]
+                    for part in reference["parts"]
+                ]
+                self.assertEqual(metadata[0]["start_byte"], 0)
+                self.assertEqual(
+                    metadata[-1]["end_byte"],
+                    len(text.encode("utf-8")),
+                )
+                self.assertTrue(
+                    all(
+                        previous["end_byte"] == current["start_byte"]
+                        for previous, current in zip(
+                            metadata,
+                            metadata[1:],
+                            strict=False,
+                        )
+                    )
+                )
+                expected_hash = runtime.sha256_bytes(text.encode("utf-8"))
+                self.assertTrue(
+                    all(
+                        item["message_sha256"] == expected_hash
+                        for item in metadata
+                    )
+                )
+                self.assertEqual(view, original)
+
+    def test_init_accepts_oversized_message_without_modifying_export(self) -> None:
+        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
+            root = Path(directory)
+            knowledge_root = root / "knowledge"
+            knowledge_root.mkdir()
+            input_path = root / "oversized.json"
+            export = json.loads(FIXTURE.read_text(encoding="utf-8"))
+            long_text = ("第一段。\n\n第二段。\n\n" * 2_000).rstrip()
+            export[0]["mapping"]["user-1"]["message"]["content"]["parts"] = [
+                long_text
+            ]
+            input_path.write_text(
+                json.dumps(export, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            original_bytes = input_path.read_bytes()
+
+            run_root, document = runtime.initialize_run(
+                knowledge_root,
+                input_path,
+                "oversized-message",
+            )
+
+            self.assertGreater(len(document["parsing"]["batches"]), 1)
+            self.assertEqual(input_path.read_bytes(), original_bytes)
+            view, _ = runtime.current_view(input_path, document)
+            fragments: list[dict[str, object]] = []
+            for index in range(1, len(document["parsing"]["batches"]) + 1):
+                selected = runtime.select_batch(view, document, index)
+                self.assertLessEqual(
+                    selected["output_bytes"],
+                    document["parsing"]["read_output_budget_bytes"],
+                )
+                fragments.extend(
+                    message
+                    for conversation in selected["conversations"]
+                    for message in conversation["messages"]
+                    if message["message_id"] == "message-user-1"
+                )
+            self.assertGreater(len(fragments), 1)
+            self.assertEqual(
+                "".join(str(fragment["text"]) for fragment in fragments),
+                long_text,
+            )
+            self.assertFalse(any(run_root.rglob("*fragment*")))
+
+    def test_fragment_contract_rejects_missing_duplicate_and_out_of_order(self) -> None:
+        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
+            root = Path(directory)
+            knowledge_root = root / "knowledge"
+            knowledge_root.mkdir()
+            input_path = root / "fragment-contract.json"
+            export = json.loads(FIXTURE.read_text(encoding="utf-8"))
+            export[0]["mapping"]["user-1"]["message"]["content"]["parts"] = [
+                "A" * 100_000
+            ]
+            input_path.write_text(
+                json.dumps(export, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            _, original = runtime.initialize_run(
+                knowledge_root,
+                input_path,
+                "fragment-contract",
+            )
+
+            def matching_locations(
+                document: dict[str, object],
+            ) -> list[tuple[list[dict[str, object]], int]]:
+                """返回超长消息分片所在列表和索引。"""
+
+                locations: list[tuple[list[dict[str, object]], int]] = []
+                for batch in document["parsing"]["batches"]:
+                    for reference in batch["conversations"]:
+                        for index, part in enumerate(reference["parts"]):
+                            if part["message_id"] == "message-user-1":
+                                locations.append((reference["parts"], index))
+                return locations
+
+            for mutation in ("missing", "duplicate", "out_of_order"):
+                with self.subTest(mutation=mutation):
+                    document = json.loads(json.dumps(original))
+                    locations = matching_locations(document)
+                    self.assertGreater(len(locations), 1)
+                    first_parts, first_index = locations[0]
+                    second_parts, second_index = locations[1]
+                    if mutation == "missing":
+                        first_parts.pop(first_index)
+                    elif mutation == "duplicate":
+                        first_parts.insert(
+                            first_index,
+                            json.loads(json.dumps(first_parts[first_index])),
+                        )
+                    else:
+                        first_part = first_parts[first_index]
+                        second_part = second_parts[second_index]
+                        first_parts[first_index] = second_part
+                        second_parts[second_index] = first_part
+                    with self.assertRaises(runtime.RunError):
+                        runtime.validate_run_document(document)
+
+    def test_batch_contract_rejects_duplicate_conversation_reference(self) -> None:
         with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
             root = Path(directory)
             knowledge_root, input_path = create_inputs(root)
@@ -374,13 +649,11 @@ class RuntimeV4Tests(unittest.TestCase):
             batch = document["parsing"]["batches"][0]
             duplicate = json.loads(json.dumps(batch["conversations"][0]))
             batch["conversations"].append(duplicate)
-            batch["message_count"] += duplicate["message_count"]
-            batch["estimated_tokens"] += duplicate["estimated_tokens"]
             run_path.write_text(
                 json.dumps(document, ensure_ascii=False), encoding="utf-8"
             )
 
-            with self.assertRaisesRegex(runtime.RunError, "重复引用可见消息"):
+            with self.assertRaisesRegex(runtime.RunError, "重复引用同一对话"):
                 runtime.load_run(run_root)
 
     def test_empty_context_is_skipped(self) -> None:
@@ -525,14 +798,13 @@ class RuntimeV4Tests(unittest.TestCase):
             self.assertIn("标准输入", missing_stderr)
 
             invalid = {
-                "format": "conversation-knowledge-curator.review-input.v1",
+                "format": "conversation-knowledge-curator.review-input.v2",
                 "outputs": [
                     {
                         "target_path": path,
                         "sources": [
                             {
-                                "source_sha256": conversation["source_sha256"],
-                                "conversation_id": conversation["conversation_id"],
+                                "conversation_ref": conversation["conversation_ref"],
                                 "message_ids": ["unknown-message"],
                             }
                         ],
@@ -553,14 +825,13 @@ class RuntimeV4Tests(unittest.TestCase):
             self.assertEqual(unchanged["outputs"], [])
 
             valid = {
-                "format": "conversation-knowledge-curator.review-input.v1",
+                "format": "conversation-knowledge-curator.review-input.v2",
                 "outputs": [
                     {
                         "target_path": path,
                         "sources": [
                             {
-                                "source_sha256": conversation["source_sha256"],
-                                "conversation_id": conversation["conversation_id"],
+                                "conversation_ref": conversation["conversation_ref"],
                                 "message_ids": [message_id],
                             }
                         ],
@@ -585,6 +856,15 @@ class RuntimeV4Tests(unittest.TestCase):
             }
             self.assertEqual(sources_by_target["one.md"], [message_ids[0]])
             self.assertEqual(sources_by_target["two.md"], [message_ids[1]])
+            self.assertTrue(
+                all(
+                    output["sources"][0]["source_sha256"]
+                    == conversation["source_sha256"]
+                    and output["sources"][0]["conversation_id"]
+                    == conversation["conversation_id"]
+                    for output in updated["outputs"]
+                )
+            )
 
     def test_modified_proposed_invalidates_review_binding(self) -> None:
         with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:

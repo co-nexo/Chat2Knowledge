@@ -10,14 +10,14 @@
 
 1. run manifest 必须使用当前格式和固定字段，未知字段会被拒绝。
 2. 移动 run 或篡改知识库根目录会被拒绝。
-3. 唯一公开 CLI 使用 run.v4，不再暴露 inspect 与 normalize 阶段。
+3. 唯一公开 CLI 使用 run.v6，不再暴露 inspect 与 normalize 阶段。
 4. 旧 Candidate、Proposal、Review 和 Apply 编排脚本不再存在。
 
 已覆盖的 CLI 行为：
 
 1. init 与 read-input 返回结构化摘要，且不落盘标准化内容。
 2. 失败返回退出码 2，且不会在知识库同级创建派生目录。
-3. apply 与 recover 返回 v4 核心的实际应用和恢复数量。
+3. apply 与 recover 返回 v5 核心的实际应用和恢复数量。
 """
 
 from __future__ import annotations
@@ -113,7 +113,7 @@ class RunInitializationTests(unittest.TestCase):
             )
             self.assertEqual(
                 document["format"],
-                "conversation-knowledge-curator.run.v4",
+                "conversation-knowledge-curator.run.v6",
             )
             self.assertTrue((run_root / "run.json").is_file())
             self.assertTrue((run_root / "proposed").is_dir())
@@ -222,7 +222,7 @@ class RunCliTests(unittest.TestCase):
             exit_code = knowledge_run.main(argv)
         return exit_code, stdout.getvalue(), stderr.getvalue()
 
-    def test_cli_v4_reads_input_without_normalized_output(self) -> None:
+    def test_cli_reads_input_without_normalized_output(self) -> None:
         with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
             root = Path(directory)
             knowledge_root, input_path = create_inputs(root)
@@ -240,7 +240,7 @@ class RunCliTests(unittest.TestCase):
             view = json.loads(read_stdout)
             self.assertEqual(
                 view["format"],
-                "conversation-knowledge-curator.visible-input.v1",
+                "conversation-knowledge-curator.visible-input.v3",
             )
             self.assertFalse((run_root / "normalized").exists())
             unexpected_review = knowledge_root.parent / "Knowledge-Base-Reviews"
