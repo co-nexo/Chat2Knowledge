@@ -494,7 +494,3 @@ def main(argv: list[str] | None = None) -> int:
     }
     print(serialize_json(summary), end="")
     return 1 if inventory["warnings"] else 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

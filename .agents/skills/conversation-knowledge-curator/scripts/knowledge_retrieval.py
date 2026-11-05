@@ -550,7 +550,3 @@ def main(argv: list[str] | None = None) -> int:
     }
     print(knowledge_inventory.serialize_json(summary), end="")
     return 1 if result["warnings"] else 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

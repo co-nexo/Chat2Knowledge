@@ -1,8 +1,8 @@
-# knowledge inventory 格式契约
+# knowledge inventory 内存规则
 
 当前格式版本：`conversation-knowledge-curator.knowledge-inventory.v1`
 
-Knowledge inventory 是对指定 Markdown 知识库的只读快照，用于召回相关文档、定位章节和在生成修改前绑定当前内容。它是可重新生成的私密运行数据，不是正式知识内容。
+Knowledge inventory 是对指定 Markdown 知识库的只读内存快照，用于计算 `run.json.knowledge_base.snapshot_sha256`、召回相关章节和在审核前检测基线变化。当前流程不把 inventory 持久化为文件。
 
 ## 版本兼容性
 
@@ -83,13 +83,9 @@ Inventory 不保存知识库绝对路径，调用方单独持有本次运行的�
 - `heading_path` 根据标题层级栈构造。相同路径重复出现时，`ordinal` 从 `0` 递增。
 - `section_id` 使用文件相对路径、完整标题路径和 `ordinal` 确定性生成；不同运行不得加入时间、绝对路径或随机数。
 
-## CLI 行为
+## 运行行为
 
-`scripts/knowledge_inventory.py inventory <knowledge-root> <new-output-file>` 只写入一个新 JSON 文件。输出父目录必须已经存在；目标已存在时拒绝覆盖。标准输出只返回状态、文件数、章节数、警告数和输出路径，不打印 Markdown 正文。
-
-- 退出码 `0`：完整生成，`status=ok`。
-- 退出码 `1`：生成成功但存在跳过的链接，`status=completed_with_issues`。
-- 退出码 `2`：输入、读取、解析或写入失败，没有正式输出。
+`init`、`context` 和 `prepare-review` 在进程内调用 inventory 核心。运行目录中不得出现 `knowledge-inventory.json`；链接警告进入命令结果或解析问题。任何 Markdown 内容变化都会改变快照哈希，使旧 run 停止审核或应用。
 
 ## 召回用途
 
