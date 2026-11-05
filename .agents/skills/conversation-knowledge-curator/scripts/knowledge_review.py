@@ -13,17 +13,20 @@ import sys
 import tempfile
 from pathlib import Path, PurePosixPath
 
+import knowledge_document_quality
 import knowledge_inventory
 import knowledge_proposals
 import knowledge_retrieval
 
 FORMAT_VERSION = "conversation-knowledge-curator.review-manifest.v1"
+REPORT_FORMAT = "conversation-knowledge-curator.review-report.v1"
 DECISIONS_FORMAT = "conversation-knowledge-curator.review-decisions.v1"
 DECISION_DRAFT_FORMAT = "conversation-knowledge-curator.review-decision-draft.v1"
 UTF8_BOM = b"\xef\xbb\xbf"
 WRITABLE_ACTIONS = {"add", "merge"}
 NON_WRITABLE_ACTIONS = {"no_change", "conflict", "defer"}
 DECISION_VALUES = {"approved", "rejected"}
+RUN_ID_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 
 
 class ReviewError(Exception):
@@ -211,6 +214,36 @@ def target_path_of(proposal: dict[str, object]) -> str | None:
     return target["path"]
 
 
+def validate_after_document(
+    after_bytes: bytes,
+    target_path: str,
+    operation_type: str,
+) -> None:
+    """在生成审核包前检查完整 after 文档的确定性结构质量。"""
+
+    text = display_text(after_bytes, target_path)
+    mode = "strict" if operation_type == "create_document" else "compatible"
+    report = knowledge_document_quality.analyze_document(
+        text,
+        mode,
+        target_path,
+    )
+    issues = report["issues"]
+    assert isinstance(issues, list)
+    if not issues:
+        return
+    details = []
+    for item in issues[:5]:
+        assert isinstance(item, dict)
+        line = item.get("line")
+        location = f"第 {line} 行" if isinstance(line, int) else "文档"
+        details.append(f"{location}：{item['message']}")
+    suffix = "" if len(issues) <= 5 else f"；另有 {len(issues) - 5} 项"
+    raise ReviewError(
+        f"知识文档质量检查失败：{target_path}：{'；'.join(details)}{suffix}"
+    )
+
+
 def prepare_write_artifacts(
     proposal: dict[str, object],
     knowledge_root: Path,
@@ -246,6 +279,7 @@ def prepare_write_artifacts(
             {"type": operation_type, "markdown": markdown},
         )
         base_sha256 = sha256_bytes(before_bytes)
+    validate_after_document(after_bytes, target_path, operation_type)
     diff_bytes = unified_diff_bytes(before_bytes, after_bytes, target_path)
     return after_bytes, diff_bytes, base_sha256
 
@@ -504,6 +538,11 @@ def validate_review_entry(
         target = proposal["target"]
         if not isinstance(operation, dict) or not isinstance(target, dict):
             raise ReviewError(f"{context} 的可写 Proposal 结构非法")
+        validate_after_document(
+            after_bytes,
+            str(entry["target_path"]),
+            str(operation["type"]),
+        )
         if operation["type"] == "create_document":
             if entry["base_file_sha256"] is not None:
                 raise ReviewError(f"{context}.base_file_sha256 应为 null")
@@ -614,6 +653,222 @@ def validate_review_package(
     if review_id != expected_review_id:
         raise ReviewError("review_id 与审核包内容不一致")
     return manifest, proposals
+
+
+def section_change_record(
+    fragment: knowledge_inventory.SectionFragment,
+) -> dict[str, object]:
+    """把章节片段转换为不复制正文的对话审核条目。"""
+
+    return {
+        "section_id": fragment.section_id,
+        "heading": fragment.heading,
+        "heading_path": list(fragment.heading_path),
+        "level": fragment.level,
+    }
+
+
+def compare_document_sections(
+    before_text: str,
+    after_text: str,
+    target_path: str,
+) -> dict[str, list[dict[str, object]]]:
+    """按稳定章节 ID 比较前后 Markdown，生成章节级结构变化。"""
+
+    before = {
+        fragment.section_id: fragment
+        for fragment in knowledge_inventory.parse_section_fragments(
+            before_text,
+            target_path,
+        )
+        if fragment.level > 0
+    }
+    after = {
+        fragment.section_id: fragment
+        for fragment in knowledge_inventory.parse_section_fragments(
+            after_text,
+            target_path,
+        )
+        if fragment.level > 0
+    }
+    added = [
+        section_change_record(after[section_id])
+        for section_id in sorted(set(after) - set(before))
+    ]
+    removed = [
+        section_change_record(before[section_id])
+        for section_id in sorted(set(before) - set(after))
+    ]
+    modified = [
+        section_change_record(after[section_id])
+        for section_id in sorted(set(before) & set(after))
+        if before[section_id].markdown != after[section_id].markdown
+    ]
+    return {"added": added, "modified": modified, "removed": removed}
+
+
+def read_current_target(
+    knowledge_root: Path,
+    proposal: dict[str, object],
+) -> tuple[bytes | None, str | None]:
+    """读取并校验审核报告所依赖的当前目标文件及目标章节标题。"""
+
+    target = proposal["target"]
+    operation = proposal["operation"]
+    if not isinstance(target, dict):
+        return None, None
+    target_path = str(target["path"])
+    if isinstance(operation, dict) and operation["type"] == "create_document":
+        try:
+            relative_path = knowledge_retrieval.safe_inventory_path(target_path)
+            knowledge_proposals.validate_new_target_path(
+                knowledge_root,
+                relative_path,
+            )
+        except (
+            knowledge_retrieval.RetrievalError,
+            knowledge_proposals.ProposalError,
+        ) as exc:
+            raise ReviewError(str(exc)) from exc
+        return None, None
+    try:
+        relative_path = knowledge_retrieval.safe_inventory_path(target_path)
+        markdown_path = knowledge_retrieval.resolve_markdown_path(
+            knowledge_root.resolve(strict=True),
+            relative_path,
+        )
+        before_bytes = markdown_path.read_bytes()
+    except (knowledge_retrieval.RetrievalError, OSError) as exc:
+        raise ReviewError(str(exc)) from exc
+    expected_sha256 = target.get("file_sha256")
+    if not isinstance(expected_sha256, str) or sha256_bytes(before_bytes) != (
+        expected_sha256
+    ):
+        raise ReviewError(f"审核目标已变化，必须重新生成 Review：{target_path}")
+    section_id = target.get("section_id")
+    if not isinstance(section_id, str):
+        return before_bytes, None
+    text = display_text(before_bytes, target_path)
+    for fragment in knowledge_inventory.parse_section_fragments(text, target_path):
+        if fragment.section_id == section_id:
+            return before_bytes, fragment.heading
+    raise ReviewError(f"审核目标章节已变化：{target_path}#{section_id}")
+
+
+def build_review_report(
+    knowledge_root: Path,
+    candidates_path: Path,
+    review_directory: Path,
+) -> dict[str, object]:
+    """生成供 Codex 直接展示的章节级审核报告，不创建新文件。"""
+
+    manifest, proposals = validate_review_package(review_directory)
+    candidates_document, candidates_raw = knowledge_retrieval.load_json_document(
+        candidates_path,
+        "knowledge candidates",
+    )
+    expected_candidates_sha256 = manifest["inputs"][
+        "knowledge_candidates_sha256"
+    ]
+    if sha256_bytes(candidates_raw) != expected_candidates_sha256:
+        raise ReviewError("knowledge candidates 与 Review 绑定哈希不一致")
+    try:
+        candidate_list = knowledge_retrieval.validate_candidates(
+            candidates_document
+        )
+    except knowledge_retrieval.RetrievalError as exc:
+        raise ReviewError(str(exc)) from exc
+    candidates = {
+        str(candidate["candidate_id"]): candidate for candidate in candidate_list
+    }
+    manifest_entries = {
+        str(entry["proposal_id"]): entry for entry in manifest["entries"]
+    }
+    action_counts = {
+        action: 0 for action in sorted(WRITABLE_ACTIONS | NON_WRITABLE_ACTIONS)
+    }
+    entries: list[dict[str, object]] = []
+    attention: list[dict[str, object]] = []
+    review_root = review_directory.resolve(strict=True)
+    for proposal_id in sorted(proposals):
+        proposal = proposals[proposal_id]
+        manifest_entry = manifest_entries[proposal_id]
+        action = str(proposal["action"])
+        action_counts[action] += 1
+        candidate_details: list[dict[str, object]] = []
+        for candidate_id in proposal["candidate_ids"]:
+            candidate = candidates.get(str(candidate_id))
+            if candidate is None:
+                raise ReviewError(f"Review 引用了不存在的候选：{candidate_id}")
+            candidate_details.append(
+                {
+                    "candidate_id": candidate["candidate_id"],
+                    "statement": candidate["statement"],
+                    "evidence": candidate["evidence"],
+                }
+            )
+
+        target_path = manifest_entry["target_path"]
+        before_bytes, target_heading = read_current_target(
+            knowledge_root,
+            proposal,
+        )
+        section_changes = {"added": [], "modified": [], "removed": []}
+        after_path = manifest_entry["after_path"]
+        if isinstance(after_path, str) and isinstance(target_path, str):
+            after_bytes = read_review_artifact(
+                review_root,
+                after_path,
+                "after 文件",
+            )
+            before_text = (
+                "" if before_bytes is None else display_text(before_bytes, target_path)
+            )
+            section_changes = compare_document_sections(
+                before_text,
+                display_text(after_bytes, target_path),
+                target_path,
+            )
+
+        flags = list(proposal["flags"])
+        report_entry: dict[str, object] = {
+            "proposal_id": proposal_id,
+            "action": action,
+            "target_path": target_path,
+            "target_heading": target_heading,
+            "rationale": proposal["rationale"],
+            "flags": flags,
+            "candidates": candidate_details,
+            "after_path": after_path,
+            "section_changes": section_changes,
+        }
+        entries.append(report_entry)
+        if flags or action in {"conflict", "defer"}:
+            attention.append(
+                {
+                    "proposal_id": proposal_id,
+                    "action": action,
+                    "target_path": target_path,
+                    "flags": flags,
+                    "reason": proposal["rationale"],
+                }
+            )
+
+    return {
+        "format": REPORT_FORMAT,
+        "review_id": manifest["review_id"],
+        "status": "needs_review",
+        "summary": {
+            "proposal_count": len(entries),
+            "writable_count": sum(
+                action_counts[action] for action in WRITABLE_ACTIONS
+            ),
+            "attention_count": len(attention),
+            "action_counts": action_counts,
+        },
+        "entries": entries,
+        "attention": attention,
+    }
 
 
 def build_review_decisions(
@@ -788,6 +1043,24 @@ def write_package_file(root: Path, relative_path: str, content: bytes) -> None:
         output.flush()
 
 
+def is_reserved_run_review_path(path: Path, knowledge_root: Path) -> bool:
+    """判断审核目录是否为知识库内固定的 run/review 位置。"""
+
+    try:
+        relative = path.relative_to(knowledge_root)
+    except ValueError:
+        return False
+    parts = relative.parts
+    return (
+        len(parts) == 4
+        and parts[0] == ".knowledge-curator"
+        and parts[1] == "runs"
+        and len(parts[2]) <= 64
+        and RUN_ID_PATTERN.fullmatch(parts[2]) is not None
+        and parts[3] == "review"
+    )
+
+
 def create_review_package(
     knowledge_root: Path,
     inventory_path: Path,
@@ -809,8 +1082,14 @@ def create_review_package(
     except OSError as exc:
         raise ReviewError("无法解析知识库或审核目录的父目录") from exc
     resolved_output = (resolved_parent / output_directory.name).resolve(strict=False)
-    if knowledge_inventory.is_within(resolved_output, resolved_root):
-        raise ReviewError("审核目录不得位于正式知识库内部")
+    if knowledge_inventory.is_within(
+        resolved_output,
+        resolved_root,
+    ) and not is_reserved_run_review_path(resolved_output, resolved_root):
+        raise ReviewError(
+            "知识库内的审核目录只能位于 "
+            ".knowledge-curator/runs/<run_id>/review"
+        )
     inventory_document, inventory_raw = knowledge_retrieval.load_json_document(
         inventory_path,
         "knowledge inventory",
@@ -885,6 +1164,13 @@ def create_parser() -> argparse.ArgumentParser:
     )
     decide_parser.add_argument("review_directory", type=Path)
     decide_parser.add_argument("decision_draft", type=Path)
+    report_parser = subparsers.add_parser(
+        "report",
+        help="校验审核包并输出供对话直接展示的章节级报告",
+    )
+    report_parser.add_argument("knowledge_root", type=Path)
+    report_parser.add_argument("candidates_file", type=Path)
+    report_parser.add_argument("review_directory", type=Path)
     return parser
 
 
@@ -917,6 +1203,12 @@ def main(argv: list[str] | None = None) -> int:
                 "writable_count": writable_count,
                 "output": str(args.output_directory.resolve()),
             }
+        elif args.command == "report":
+            summary = build_review_report(
+                args.knowledge_root,
+                args.candidates_file,
+                args.review_directory,
+            )
         elif args.command == "decide":
             decisions = create_decisions_file(
                 args.review_directory,
@@ -956,7 +1248,3 @@ def main(argv: list[str] | None = None) -> int:
 
     print(knowledge_inventory.serialize_json(summary), end="")
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

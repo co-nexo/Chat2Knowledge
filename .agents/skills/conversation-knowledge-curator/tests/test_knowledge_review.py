@@ -5,6 +5,7 @@
 1. 重新校验 proposals、retrieval、inventory 和 candidates 的哈希与引用关系。
 2. 拒绝被修改的 proposals 和知识库变化后的过期快照。
 3. 已有审核目录不会被覆盖，失败时不留下正式审核目录。
+4. 知识库内只允许固定的 `.knowledge-curator/runs/<run_id>/review` 审核位置。
 
 已覆盖的审核产物行为：
 
@@ -12,7 +13,8 @@
 2. 非写入提案进入 manifest，但不生成 after 或 diff。
 3. replace 只替换直属章节，insert 位于完整章节子树之后。
 4. 现有 Markdown 的 UTF-8 BOM 和 CRLF 会保留，新建文档从 /dev/null 生成 diff。
-5. 审核包生成过程不会修改正式知识库。
+5. 新建文档必须通过严格标题编号检查，现有文档必须保持基本标题结构。
+6. 审核包生成过程不会修改正式知识库。
 
 已覆盖的 CLI 行为：
 
@@ -25,6 +27,12 @@
 2. proposal 和 diff 哈希从已验证 manifest 派生，支持写入与非写入提案。
 3. 拒绝未知、重复或非法决定，以及被修改的审核文件。
 4. decisions.json 独占创建，CLI 输出批准和拒绝数量。
+
+已覆盖的对话审核报告行为：
+
+1. 报告直接汇总 Proposal、候选 Evidence、章节级变化和风险关注项。
+2. 报告重新绑定 candidates 与当前知识文件，拒绝篡改或过期输入。
+3. report CLI 只输出结构化结果，不创建额外报告文件。
 """
 
 from __future__ import annotations
@@ -64,6 +72,10 @@ knowledge_inventory = load_script(
 knowledge_retrieval = load_script(
     "knowledge_retrieval",
     SCRIPTS_DIR / "knowledge_retrieval.py",
+)
+knowledge_document_quality = load_script(
+    "knowledge_document_quality",
+    SCRIPTS_DIR / "knowledge_document_quality.py",
 )
 knowledge_proposals = load_script(
     "knowledge_proposals",
@@ -399,6 +411,27 @@ class ReviewValidationTests(unittest.TestCase):
             after.rindex("## 默认 IDE"),
         )
 
+    def test_broken_after_document_is_rejected_before_review(self) -> None:
+        inventory = knowledge_inventory.build_inventory(FIXTURE_ROOT)
+        target = section_target(
+            inventory,
+            "preferences/development-tools.md",
+            "开发工具偏好",
+        )
+        documents = build_stage_documents(
+            ide_operation={
+                "type": "replace_section",
+                "markdown": "### 错误层级\n\n正文。\n",
+            },
+            ide_target=target,
+        )
+
+        with self.assertRaisesRegex(
+            knowledge_review.ReviewError,
+            "质量检查失败",
+        ):
+            build_review(*documents)
+
 
 class ReviewEncodingTests(unittest.TestCase):
     def test_existing_file_preserves_bom_and_crlf(self) -> None:
@@ -501,7 +534,11 @@ class ReviewEncodingTests(unittest.TestCase):
                     "rationale": "创建独立主题。",
                     "operation": {
                         "type": "create_document",
-                        "markdown": "# JetBrains\n\n知识内容。\n",
+                        "markdown": (
+                            "# JetBrains\n\n"
+                            "本文记录合成的 IDE 知识。\n\n"
+                            "## 1. 适用范围\n\n知识内容。\n"
+                        ),
                     },
                     "flags": [],
                 },
@@ -549,6 +586,98 @@ class ReviewEncodingTests(unittest.TestCase):
         diff = artifacts[entry["diff_path"]].decode("utf-8")
         self.assertTrue(diff.startswith("--- /dev/null\n+++ b/new/jetbrains.md\n"))
         self.assertIsNone(entry["base_file_sha256"])
+
+
+class ReviewReportTests(unittest.TestCase):
+    def test_report_contains_section_changes_evidence_and_attention(self) -> None:
+        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
+            root = Path(directory)
+            review_path, manifest = create_review_fixture(root)
+
+            report = knowledge_review.build_review_report(
+                FIXTURE_ROOT,
+                root / "candidates.json",
+                review_path,
+            )
+
+            self.assertEqual(
+                report["format"],
+                "conversation-knowledge-curator.review-report.v1",
+            )
+            self.assertEqual(report["review_id"], manifest["review_id"])
+            self.assertEqual(report["status"], "needs_review")
+            self.assertEqual(report["summary"]["proposal_count"], 3)
+            self.assertEqual(report["summary"]["writable_count"], 1)
+            writable = next(
+                entry for entry in report["entries"] if entry["action"] == "merge"
+            )
+            self.assertEqual(
+                writable["candidates"][0]["statement"],
+                "项目应兼容 JetBrains IDE。",
+            )
+            self.assertEqual(
+                writable["candidates"][0]["evidence"][0]["message_ids"],
+                ["message-1"],
+            )
+            self.assertIn(
+                "JetBrains",
+                {
+                    change["heading"]
+                    for change in writable["section_changes"]["modified"]
+                },
+            )
+            self.assertEqual(report["summary"]["attention_count"], 1)
+            self.assertEqual(report["attention"][0]["action"], "defer")
+
+    def test_report_rejects_tampered_candidates(self) -> None:
+        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
+            root = Path(directory)
+            review_path, _ = create_review_fixture(root)
+            candidates_path = root / "candidates.json"
+            candidates = json.loads(candidates_path.read_text(encoding="utf-8"))
+            candidates["candidates"][0]["statement"] = "被修改"
+            candidates_path.write_text(
+                json.dumps(candidates, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(
+                knowledge_review.ReviewError,
+                "绑定哈希不一致",
+            ):
+                knowledge_review.build_review_report(
+                    FIXTURE_ROOT,
+                    candidates_path,
+                    review_path,
+                )
+
+    def test_report_cli_outputs_json_without_new_report_file(self) -> None:
+        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
+            root = Path(directory)
+            review_path, _ = create_review_fixture(root)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
+                stderr
+            ):
+                exit_code = knowledge_review.main(
+                    [
+                        "report",
+                        str(FIXTURE_ROOT),
+                        str(root / "candidates.json"),
+                        str(review_path),
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0, stderr.getvalue())
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertEqual(
+                json.loads(stdout.getvalue())["format"],
+                "conversation-knowledge-curator.review-report.v1",
+            )
+            self.assertFalse((review_path / "report.json").exists())
+            self.assertFalse((review_path / "report.md").exists())
 
 
 class ReviewDecisionTests(unittest.TestCase):
@@ -839,6 +968,47 @@ class ReviewPackageCliTests(unittest.TestCase):
             self.assertTrue(stderr.getvalue().strip())
             self.assertFalse(output_path.exists())
 
+    def test_quality_failure_does_not_leave_review_directory(self) -> None:
+        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
+            root = Path(directory)
+            inventory = knowledge_inventory.build_inventory(FIXTURE_ROOT)
+            target = section_target(
+                inventory,
+                "preferences/development-tools.md",
+                "开发工具偏好",
+            )
+            candidates, inventory, retrieval, proposals = build_stage_documents(
+                ide_operation={
+                    "type": "replace_section",
+                    "markdown": "### 错误层级\n\n正文。\n",
+                },
+                ide_target=target,
+            )
+            inventory_path = root / "inventory.json"
+            candidates_path = root / "candidates.json"
+            retrieval_path = root / "retrieval.json"
+            proposals_path = root / "proposals.json"
+            output_path = root / "review"
+            write_json(inventory_path, inventory)
+            write_json(candidates_path, candidates)
+            write_json(retrieval_path, retrieval)
+            write_json(proposals_path, proposals)
+
+            with self.assertRaisesRegex(
+                knowledge_review.ReviewError,
+                "质量检查失败",
+            ):
+                knowledge_review.create_review_package(
+                    FIXTURE_ROOT,
+                    inventory_path,
+                    candidates_path,
+                    retrieval_path,
+                    proposals_path,
+                    output_path,
+                )
+
+            self.assertFalse(output_path.exists())
+
     def test_review_directory_cannot_be_inside_knowledge_root(self) -> None:
         output_path = FIXTURE_ROOT / ".review-test-output"
         self.assertFalse(output_path.exists())
@@ -854,6 +1024,46 @@ class ReviewPackageCliTests(unittest.TestCase):
             )
 
         self.assertFalse(output_path.exists())
+
+    def test_review_directory_can_use_reserved_run_location(self) -> None:
+        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
+            root = Path(directory)
+            knowledge_root = root / "knowledge"
+            shutil.copytree(FIXTURE_ROOT, knowledge_root)
+            candidates, inventory, retrieval, proposals = build_stage_documents(
+                knowledge_root
+            )
+            inventory_path = root / "inventory.json"
+            candidates_path = root / "candidates.json"
+            retrieval_path = root / "retrieval.json"
+            proposals_path = root / "proposals.json"
+            write_json(inventory_path, inventory)
+            write_json(candidates_path, candidates)
+            write_json(retrieval_path, retrieval)
+            write_json(proposals_path, proposals)
+            run_root = (
+                knowledge_root
+                / ".knowledge-curator"
+                / "runs"
+                / "reserved-run"
+            )
+            run_root.mkdir(parents=True)
+            output_path = run_root / "review"
+
+            manifest = knowledge_review.create_review_package(
+                knowledge_root,
+                inventory_path,
+                candidates_path,
+                retrieval_path,
+                proposals_path,
+                output_path,
+            )
+
+            self.assertTrue((output_path / "review-manifest.json").is_file())
+            self.assertEqual(
+                manifest["format"],
+                "conversation-knowledge-curator.review-manifest.v1",
+            )
 
 
 if __name__ == "__main__":

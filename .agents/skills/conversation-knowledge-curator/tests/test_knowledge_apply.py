@@ -64,6 +64,10 @@ knowledge_retrieval = load_script(
     "knowledge_retrieval",
     SCRIPTS_DIR / "knowledge_retrieval.py",
 )
+knowledge_document_quality = load_script(
+    "knowledge_document_quality",
+    SCRIPTS_DIR / "knowledge_document_quality.py",
+)
 knowledge_proposals = load_script(
     "knowledge_proposals",
     SCRIPTS_DIR / "knowledge_proposals.py",
@@ -182,7 +186,11 @@ def create_pipeline(
         ide_action = "add"
         ide_operation = {
             "type": "create_document",
-            "markdown": "# JetBrains\n\n项目应兼容 JetBrains IDE。\n",
+            "markdown": (
+                "# JetBrains\n\n"
+                "本文记录合成的 IDE 知识。\n\n"
+                "## 1. 适用范围\n\n项目应兼容 JetBrains IDE。\n"
+            ),
         }
     else:
         ide_target = section_target(
