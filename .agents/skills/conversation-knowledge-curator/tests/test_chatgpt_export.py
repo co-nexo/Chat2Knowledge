@@ -5,7 +5,8 @@
 1. inspect 报告结构统计，但不泄露消息正文和隐藏内容。
 2. 识别单个 JSON、目录和 ZIP，并在目录中继续处理其他有效来源。
 3. 在内存中检查 ZIP，拒绝不安全成员，记录损坏压缩包问题。
-4. 拒绝不存在的路径、不支持的文件类型和不支持的 JSON 容器。
+4. 目录发现不跟随符号链接，避免读取来源根目录之外的数据。
+5. 拒绝不存在的路径、不支持的文件类型和不支持的 JSON 容器。
 
 已覆盖的标准化行为：
 
@@ -13,18 +14,14 @@
 2. 排除 hidden reasoning、工具载荷和其他非用户可见内容。
 3. 活动分支不可确认时跳过对话，并在诊断信息中记录原因。
 4. 为缺失或重复的 conversation/message ID 生成稳定唯一替代值。
-5. 只标准化 inspect 确认支持的来源。
-6. 批量处理 JSON、ZIP 和目录，生成逐来源文件及 manifest。
-7. CLI 返回结构化结果，并拒绝覆盖、追加或使用相同输入输出路径。
+5. 只标准化 inspect 确认支持的来源，并保持结果在内存中。
 
 """
 
 from __future__ import annotations
 
-import contextlib
 import copy
 import importlib.util
-import io
 import json
 import sys
 import tempfile
@@ -91,6 +88,27 @@ class InspectExportTests(unittest.TestCase):
             self.assertEqual(report["discovery"]["other_file_count"], 1)
             self.assertEqual(report["summary"]["supported_count"], 2)
             self.assertEqual(report["summary"]["invalid_json_count"], 1)
+
+    def test_directory_inspection_does_not_follow_links(self) -> None:
+        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
+            root = Path(directory)
+            input_dir = root / "imports"
+            outside = root / "outside"
+            input_dir.mkdir()
+            outside.mkdir()
+            (input_dir / "local.json").write_bytes(FIXTURE_PATH.read_bytes())
+            (outside / "external.json").write_bytes(FIXTURE_PATH.read_bytes())
+            link = input_dir / "linked"
+            try:
+                link.symlink_to(outside, target_is_directory=True)
+            except OSError:
+                self.skipTest("当前系统无法创建目录符号链接")
+
+            resolved = chatgpt_export.resolve_input(input_dir)
+
+            self.assertEqual(len(resolved.sources), 1)
+            self.assertEqual(resolved.sources[0].path.name, "local.json")
+            self.assertTrue(any("跳过链接目录" in item for item in resolved.warnings))
 
     def test_zip_is_inspected_in_memory_and_unsafe_member_is_skipped(self) -> None:
         with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
@@ -274,113 +292,6 @@ class NormalizeExportTests(unittest.TestCase):
                 chatgpt_export.normalize_source(
                     source, inspection=inspection
                 )
-
-    def test_directory_normalization_writes_per_source_files_and_manifest(self) -> None:
-        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
-            input_dir = Path(directory) / "imports"
-            input_dir.mkdir()
-            (input_dir / "valid.json").write_bytes(FIXTURE_PATH.read_bytes())
-            (input_dir / "invalid.json").write_text("{", encoding="utf-8")
-            archive_path = input_dir / "export.zip"
-            with zipfile.ZipFile(
-                archive_path, "w", compression=zipfile.ZIP_DEFLATED
-            ) as archive:
-                archive.writestr("conversations.json", FIXTURE_PATH.read_bytes())
-            output_dir = Path(directory) / "normalized"
-
-            manifest = chatgpt_export.normalize_input(input_dir, output_dir)
-
-            self.assertEqual(manifest["status"], "completed_with_issues")
-            self.assertEqual(manifest["summary"]["normalized_source_count"], 2)
-            self.assertEqual(manifest["summary"]["skipped_source_count"], 1)
-            self.assertEqual(manifest["summary"]["failed_source_count"], 0)
-            self.assertEqual(len(list(output_dir.glob("*.normalized.json"))), 2)
-            self.assertTrue((output_dir / "manifest.json").is_file())
-            persisted_manifest = json.loads(
-                (output_dir / "manifest.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(persisted_manifest, manifest)
-            self.assertNotIn("Visible question", json.dumps(manifest))
-            normalized_entries = [
-                entry
-                for entry in manifest["entries"]
-                if entry["status"] == "normalized"
-            ]
-            self.assertTrue(
-                all("normalization" in entry for entry in normalized_entries)
-            )
-            normalized_sources = [
-                entry["source"]["kind"]
-                for entry in normalized_entries
-            ]
-            self.assertEqual(normalized_sources, ["zip_member", "json_file"])
-            normalized_path = output_dir / normalized_entries[0]["output"]
-            normalized_document = json.loads(
-                normalized_path.read_text(encoding="utf-8")
-            )
-            self.assertEqual(
-                set(normalized_document),
-                {"format", "source_sha256", "conversations"},
-            )
-            self.assertEqual(
-                normalized_document["source_sha256"],
-                normalized_entries[0]["source"]["sha256"],
-            )
-            self.assertEqual(
-                set(normalized_entries[0]["normalization"]),
-                {
-                    "branch_policy",
-                    "source_conversation_count",
-                    "normalized_conversation_count",
-                    "skipped_conversation_count",
-                    "message_count",
-                    "skipped_conversations",
-                    "warnings",
-                },
-            )
-
-    def test_normalization_refuses_existing_output_directory(self) -> None:
-        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
-            output_dir = Path(directory) / "normalized"
-            output_dir.mkdir()
-
-            with self.assertRaises(chatgpt_export.ExportError):
-                chatgpt_export.normalize_input(FIXTURE_PATH, output_dir)
-
-    def test_normalize_cli_writes_output_directory_and_manifest(self) -> None:
-        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
-            output_dir = Path(directory) / "normalized"
-            stdout = io.StringIO()
-
-            with contextlib.redirect_stdout(stdout):
-                exit_code = chatgpt_export.main(
-                    ["normalize", str(FIXTURE_PATH), str(output_dir)]
-                )
-
-            self.assertEqual(exit_code, 0)
-            self.assertTrue((output_dir / "manifest.json").is_file())
-            printed_manifest = json.loads(stdout.getvalue())
-            self.assertEqual(
-                printed_manifest["format"],
-                "conversation-knowledge-curator.manifest.v1",
-            )
-
-    def test_output_creation_never_overwrites(self) -> None:
-        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
-            output = Path(directory) / "normalized.json"
-            chatgpt_export.write_new_json(output, {"first": True})
-
-            with self.assertRaises(FileExistsError):
-                chatgpt_export.write_new_json(output, {"second": True})
-
-            self.assertEqual(
-                json.loads(output.read_text(encoding="utf-8")), {"first": True}
-            )
-
-    def test_same_input_and_output_is_rejected_by_cli(self) -> None:
-        with self.assertRaises(SystemExit) as raised:
-            chatgpt_export.main(["normalize", str(FIXTURE_PATH), str(FIXTURE_PATH)])
-        self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":

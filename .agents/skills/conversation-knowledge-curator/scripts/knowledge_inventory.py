@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""只读扫描 Markdown 知识库并生成确定性的结构目录。"""
+"""供统一运行时只读扫描 Markdown 知识库的确定性内部库。"""
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
 import os
 import re
-import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -406,91 +404,3 @@ def build_inventory(knowledge_root: Path) -> dict[str, object]:
         "files": entries,
         "warnings": warnings,
     }
-
-
-def serialize_json(value: object) -> str:
-    """按仓库约定序列化稳定、可读且保留中文的 JSON。"""
-
-    return json.dumps(value, ensure_ascii=False, indent=2) + "\n"
-
-
-def write_new_file(path: Path, content: str) -> None:
-    """以独占模式创建完整输出，失败时清理且绝不覆盖已有文件。"""
-
-    parent = path.parent
-    if not parent.is_dir():
-        raise InventoryError(f"输出父目录不存在：{parent}")
-    if path.exists():
-        raise InventoryError(f"输出文件已存在：{path}")
-
-    try:
-        with path.open("x", encoding="utf-8", newline="\n") as output:
-            output.write(content)
-            output.flush()
-            os.fsync(output.fileno())
-    except FileExistsError as exc:
-        raise InventoryError(f"输出文件已存在：{path}") from exc
-    except OSError as exc:
-        path.unlink(missing_ok=True)
-        raise InventoryError(f"无法创建输出文件：{path}") from exc
-
-
-def create_inventory_file(
-    knowledge_root: Path,
-    output_path: Path,
-) -> dict[str, object]:
-    """在全部扫描成功后写入一个新的 inventory 文件。"""
-
-    if output_path.exists():
-        raise InventoryError(f"输出文件已存在：{output_path}")
-    inventory = build_inventory(knowledge_root)
-    write_new_file(output_path, serialize_json(inventory))
-    return inventory
-
-
-def create_parser() -> argparse.ArgumentParser:
-    """创建非交互式命令行解析器。"""
-
-    parser = argparse.ArgumentParser(
-        description="只读扫描 Markdown 知识库并生成结构目录。"
-    )
-    subparsers = parser.add_subparsers(dest="command", required=True)
-    inventory_parser = subparsers.add_parser(
-        "inventory",
-        help="生成 knowledge-inventory.v1 JSON 文件",
-    )
-    inventory_parser.add_argument("knowledge_root", type=Path)
-    inventory_parser.add_argument("output_file", type=Path)
-    return parser
-
-
-def main(argv: list[str] | None = None) -> int:
-    """运行 CLI，并按契约返回成功、带警告或失败退出码。"""
-
-    parser = create_parser()
-    args = parser.parse_args(argv)
-    try:
-        if args.command != "inventory":
-            parser.error("未知命令")
-        inventory = create_inventory_file(
-            args.knowledge_root,
-            args.output_file,
-        )
-    except (InventoryError, OSError) as exc:
-        print(f"错误：{exc}", file=sys.stderr)
-        return 2
-
-    section_count = sum(
-        len(entry["sections"])
-        for entry in inventory["files"]
-        if isinstance(entry, dict)
-    )
-    summary = {
-        "status": inventory["status"],
-        "file_count": len(inventory["files"]),
-        "section_count": section_count,
-        "warning_count": len(inventory["warnings"]),
-        "output": str(args.output_file.resolve()),
-    }
-    print(serialize_json(summary), end="")
-    return 1 if inventory["warnings"] else 0

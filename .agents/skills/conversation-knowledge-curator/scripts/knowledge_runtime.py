@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""实现 conversation-knowledge-curator.run.v2 的单流程运行核心。"""
+"""实现 conversation-knowledge-curator.run.v4 的单流程运行核心。"""
 
 from __future__ import annotations
 
@@ -20,16 +20,16 @@ import knowledge_document_quality
 import knowledge_inventory
 import knowledge_retrieval
 
-FORMAT_VERSION = "conversation-knowledge-curator.run.v2"
+FORMAT_VERSION = "conversation-knowledge-curator.run.v4"
 VISIBLE_FORMAT = "conversation-knowledge-curator.visible-input.v1"
 CONTEXT_FORMAT = "conversation-knowledge-curator.context.v1"
-REVIEW_FORMAT = "conversation-knowledge-curator.review.v2"
+REVIEW_FORMAT = "conversation-knowledge-curator.review.v3"
 REVIEW_INPUT_FORMAT = "conversation-knowledge-curator.review-input.v1"
 RUN_ID_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 RUN_RELATIVE_ROOT = PurePosixPath(".knowledge-curator/runs")
 PROPOSED_DIRECTORY = "proposed"
 APPLY_STATE_FILE = "apply-state.json"
-DEFAULT_BATCH_CHARACTERS = 120_000
+DEFAULT_BATCH_TOKEN_BUDGET = 12_000
 EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 ISSUE_KINDS = {
@@ -132,23 +132,51 @@ def inventory_snapshot(knowledge_root: Path) -> tuple[dict[str, object], str]:
     return inventory, digest
 
 
-def aggregate_source_sha256(items: list[dict[str, object]]) -> str:
-    """根据来源身份和内容哈希生成输入集合哈希。"""
+def inventory_domains(inventory: dict[str, object]) -> list[str]:
+    """从现有相对路径提取稳定的顶层领域线索，供 Codex 决定是否检索。"""
 
-    identities: list[dict[str, str]] = []
-    for item in items:
-        source = item.get("source")
-        if not isinstance(source, dict):
+    domains: set[str] = set()
+    files = inventory.get("files", [])
+    if not isinstance(files, list):
+        return []
+    for entry in files:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
             continue
-        identities.append(
-            {
-                "kind": str(source.get("kind", "")),
-                "path": str(source.get("path", "")),
-                "member_path": str(source.get("member_path", "")),
-                "sha256": str(source.get("sha256", "")),
-            }
-        )
-    identities.sort(key=lambda item: serialize_json(item))
+        path = PurePosixPath(str(entry["path"]))
+        if len(path.parts) > 1:
+            domains.add(path.parts[0])
+        else:
+            title = entry.get("title")
+            domains.add(str(title) if isinstance(title, str) and title else path.stem)
+    return sorted(domains, key=lambda value: (value.casefold(), value))
+
+
+def input_source_record(source: dict[str, object]) -> dict[str, object]:
+    """把解析器来源描述收敛为 run 中稳定、无正文的来源记录。"""
+
+    kind = str(source.get("kind", ""))
+    path = (
+        source.get("path")
+        if kind == "json_file"
+        else source.get("archive_path")
+    )
+    return {
+        "kind": kind,
+        "path": str(path or ""),
+        "member_path": (
+            str(source["member_path"])
+            if source.get("member_path") is not None
+            else None
+        ),
+        "sha256": str(source.get("sha256", "")),
+        "size_bytes": source.get("size_bytes"),
+    }
+
+
+def aggregate_source_sha256(records: list[dict[str, object]]) -> str:
+    """根据完整来源身份和内容哈希生成输入集合哈希。"""
+
+    identities = sorted(records, key=serialize_json)
     return sha256_bytes(serialize_json(identities).encode("utf-8"))
 
 
@@ -158,8 +186,8 @@ def collect_visible_view(
     """检查并在内存中构造用户可见消息视图，不写 normalized 文件。"""
 
     resolved = chatgpt_export.resolve_input(input_path)
-    if resolved.input_type not in {"json_file", "zip_archive"}:
-        raise RunError("当前运行入口只接受单个 ChatGPT JSON 或 ZIP 文件")
+    if resolved.input_type not in {"json_file", "zip_archive", "directory"}:
+        raise RunError("当前运行入口只接受 ChatGPT JSON、ZIP 或来源目录")
     inspections = [
         chatgpt_export.inspect_source(source) for source in resolved.sources
     ]
@@ -173,7 +201,9 @@ def collect_visible_view(
 
     sources: list[dict[str, object]] = []
     conversations: list[dict[str, object]] = []
-    warnings: list[dict[str, object]] = list(resolved.warnings)
+    source_records: list[dict[str, object]] = []
+    seen_source_hashes: set[str] = set()
+    warnings: list[object] = list(resolved.warnings)
     for source, inspection in zip(resolved.sources, inspections, strict=True):
         result = chatgpt_export.normalize_source(
             source,
@@ -182,6 +212,17 @@ def collect_visible_view(
         )
         source_info = dict(result.source)
         source_sha = str(source_info["sha256"])
+        source_records.append(input_source_record(source_info))
+        if source_sha in seen_source_hashes:
+            warnings.append(
+                {
+                    "code": "duplicate_source_content",
+                    "source_sha256": source_sha,
+                    "message": "来源内容与前序来源完全相同，已避免重复处理",
+                }
+            )
+            continue
+        seen_source_hashes.add(source_sha)
         source_conversations: list[dict[str, object]] = []
         for conversation in result.document["conversations"]:
             item = dict(conversation)
@@ -202,7 +243,8 @@ def collect_visible_view(
     }
     metadata = {
         "input_type": resolved.input_type,
-        "input_sha256": aggregate_source_sha256(inspections),
+        "input_sha256": aggregate_source_sha256(source_records),
+        "sources": source_records,
         "conversation_count": len(conversations),
         "message_count": sum(
             len(item.get("messages", [])) for item in conversations
@@ -213,49 +255,139 @@ def collect_visible_view(
     return view, metadata
 
 
+def estimated_tokens(value: object) -> int:
+    """用 UTF-8 字节数作为保守 Token 上界，避免低估混合语言输入。"""
+
+    return max(1, len(serialize_json(value).encode("utf-8")))
+
+
+def message_units(messages: list[dict[str, object]]) -> list[list[dict[str, object]]]:
+    """优先把一个 user 消息及其后续 assistant 回复保留在同一处理单元。"""
+
+    units: list[list[dict[str, object]]] = []
+    current: list[dict[str, object]] = []
+    for message in messages:
+        if message.get("role") == "user" and current:
+            units.append(current)
+            current = []
+        current.append(message)
+    if current:
+        units.append(current)
+    return units
+
+
+def conversation_segments(
+    conversation: dict[str, object], token_budget: int
+) -> list[dict[str, object]]:
+    """优先保留完整对话，超预算时按连续消息单元拆分。"""
+
+    messages_value = conversation.get("messages")
+    if not isinstance(messages_value, list) or not all(
+        isinstance(message, dict) for message in messages_value
+    ):
+        raise RunError("标准化对话 messages 必须是对象数组")
+    messages: list[dict[str, object]] = list(messages_value)
+    base = {
+        key: value for key, value in conversation.items() if key != "messages"
+    }
+
+    def segment_for(items: list[dict[str, object]]) -> dict[str, object]:
+        view = {**base, "messages": items}
+        return {
+            "source_sha256": str(conversation["source_sha256"]),
+            "conversation_id": str(conversation["conversation_id"]),
+            "message_ids": [str(message["message_id"]) for message in items],
+            "message_count": len(items),
+            "estimated_tokens": estimated_tokens(view),
+        }
+
+    complete = segment_for(messages)
+    if complete["estimated_tokens"] <= token_budget:
+        return [complete]
+
+    segments: list[dict[str, object]] = []
+    pending: list[dict[str, object]] = []
+    for unit in message_units(messages):
+        candidate = segment_for([*pending, *unit])
+        if candidate["estimated_tokens"] <= token_budget:
+            pending.extend(unit)
+            continue
+        if pending:
+            segments.append(segment_for(pending))
+            pending = []
+        unit_segment = segment_for(unit)
+        if unit_segment["estimated_tokens"] <= token_budget:
+            pending.extend(unit)
+            continue
+        for message in unit:
+            message_segment = segment_for([message])
+            if message_segment["estimated_tokens"] > token_budget:
+                raise RunError(
+                    "单条可见消息超过 read-input Token 预算，无法在消息边界安全拆分："
+                    f"{message.get('message_id', '<unknown>')}"
+                )
+            segments.append(message_segment)
+    if pending:
+        segments.append(segment_for(pending))
+    return segments
+
+
 def build_batches(
     conversations: list[dict[str, object]],
-    maximum_characters: int = DEFAULT_BATCH_CHARACTERS,
+    token_budget: int = DEFAULT_BATCH_TOKEN_BUDGET,
 ) -> list[dict[str, object]]:
-    """按完整对话构造确定性批次元数据，不复制正文。"""
+    """按保守 Token 预算构造批次，单个大对话按消息边界拆分。"""
 
+    if token_budget < 1:
+        raise RunError("Token 预算必须是正整数")
+    segments = [
+        segment
+        for conversation in conversations
+        for segment in conversation_segments(conversation, token_budget)
+    ]
     batches: list[dict[str, object]] = []
-    current_refs: list[dict[str, str]] = []
-    current_characters = 0
-    current_messages = 0
-    for conversation in conversations:
-        messages = conversation.get("messages", [])
-        encoded = serialize_json(conversation)
-        size = len(encoded)
-        if current_refs and current_characters + size > maximum_characters:
+    current: list[dict[str, object]] = []
+    current_tokens = 0
+    for segment in segments:
+        segment_tokens = int(segment["estimated_tokens"])
+        if current and current_tokens + segment_tokens > token_budget:
             batches.append(
                 {
                     "index": len(batches) + 1,
-                    "conversation_count": len(current_refs),
-                    "message_count": current_messages,
-                    "character_count": current_characters,
-                    "conversations": current_refs,
+                    "conversation_count": len(
+                        {
+                            (
+                                str(item["source_sha256"]),
+                                str(item["conversation_id"]),
+                            )
+                            for item in current
+                        }
+                    ),
+                    "message_count": sum(int(item["message_count"]) for item in current),
+                    "estimated_tokens": current_tokens,
+                    "conversations": current,
                 }
             )
-            current_refs = []
-            current_characters = 0
-            current_messages = 0
-        current_refs.append(
-            {
-                "source_sha256": str(conversation["source_sha256"]),
-                "conversation_id": str(conversation["conversation_id"]),
-            }
-        )
-        current_characters += size
-        current_messages += len(messages) if isinstance(messages, list) else 0
-    if current_refs:
+            current = []
+            current_tokens = 0
+        current.append(segment)
+        current_tokens += segment_tokens
+    if current:
         batches.append(
             {
                 "index": len(batches) + 1,
-                "conversation_count": len(current_refs),
-                "message_count": current_messages,
-                "character_count": current_characters,
-                "conversations": current_refs,
+                "conversation_count": len(
+                    {
+                        (
+                            str(item["source_sha256"]),
+                            str(item["conversation_id"]),
+                        )
+                        for item in current
+                    }
+                ),
+                "message_count": sum(int(item["message_count"]) for item in current),
+                "estimated_tokens": current_tokens,
+                "conversations": current,
             }
         )
     return batches
@@ -288,6 +420,7 @@ def parse_review_input(
 ) -> tuple[dict[str, list[dict[str, object]]], list[dict[str, object]]]:
     """严格校验标准输入中的文档级来源和风险元数据。"""
 
+    raw_text = raw_text.removeprefix("\ufeff")
     if not raw_text.strip():
         raise RunError("prepare-review 必须从标准输入接收来源元数据 JSON")
     try:
@@ -396,6 +529,23 @@ def parse_review_input(
     return source_map, normalized_issues
 
 
+def read_standard_input() -> str:
+    """读取审核 JSON，兼容 UTF-8 BOM 和带 BOM 的 UTF-16 管道输入。"""
+
+    buffer = getattr(sys.stdin, "buffer", None)
+    if buffer is None:
+        return sys.stdin.read()
+    raw = buffer.read()
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encoding = "utf-16"
+    else:
+        encoding = "utf-8-sig"
+    try:
+        return raw.decode(encoding)
+    except UnicodeDecodeError as exc:
+        raise RunError("审核元数据标准输入必须使用 UTF-8 或带 BOM 的 UTF-16") from exc
+
+
 def initialize_run(
     knowledge_root: Path,
     input_path: Path,
@@ -417,6 +567,8 @@ def initialize_run(
     _, metadata = collect_visible_view(source, branch)
     inventory, snapshot_sha = inventory_snapshot(root)
     batches = build_batches(metadata["conversations"])
+    if not batches:
+        raise RunError("输入中没有可用于知识整理的可见 user/assistant 消息")
     run_root = expected_run_root(root, normalized_id)
     if run_root.exists():
         raise RunError(f"run 目录已存在，拒绝覆盖：{run_root}")
@@ -437,6 +589,7 @@ def initialize_run(
             "sha256": metadata["input_sha256"],
             "type": metadata["input_type"],
             "branch_policy": branch,
+            "sources": metadata["sources"],
         },
         "parsing": {
             "conversation_count": metadata["conversation_count"],
@@ -447,6 +600,8 @@ def initialize_run(
         "knowledge_base": {
             "empty": not bool(inventory["files"]),
             "snapshot_sha256": snapshot_sha,
+            "document_count": len(inventory["files"]),
+            "domains": inventory_domains(inventory),
         },
         "outputs": [],
         "issues": [],
@@ -468,7 +623,7 @@ def initialize_run(
 
 
 def validate_run_document(document: object) -> dict[str, object]:
-    """严格校验 run.v2 顶层和关键子结构。"""
+    """严格校验 run.v4 顶层和关键子结构。"""
 
     if not isinstance(document, dict):
         raise RunError("run.json 顶层必须是对象")
@@ -481,9 +636,12 @@ def validate_run_document(document: object) -> dict[str, object]:
         "run.json ",
     )
     if document["format"] != FORMAT_VERSION:
-        raise RunError("仅支持 conversation-knowledge-curator.run.v2")
+        raise RunError("仅支持 conversation-knowledge-curator.run.v4")
     validate_run_id(document["run_id"])
-    if document["status"] not in {"initialized", "review_ready", "applied"}:
+    if (
+        not isinstance(document["status"], str)
+        or document["status"] not in {"initialized", "review_ready", "applied"}
+    ):
         raise RunError("run.json.status 无效")
     if not isinstance(document["knowledge_root"], str):
         raise RunError("run.json.knowledge_root 必须是字符串")
@@ -501,7 +659,9 @@ def validate_run_document(document: object) -> dict[str, object]:
     assert isinstance(knowledge_base, dict)
     assert isinstance(apply_value, dict)
     require_exact_fields(
-        input_value, {"path", "sha256", "type", "branch_policy"}, "run.json.input "
+        input_value,
+        {"path", "sha256", "type", "branch_policy", "sources"},
+        "run.json.input ",
     )
     require_exact_fields(
         parsing,
@@ -509,25 +669,167 @@ def validate_run_document(document: object) -> dict[str, object]:
         "run.json.parsing ",
     )
     require_exact_fields(
-        knowledge_base, {"empty", "snapshot_sha256"}, "run.json.knowledge_base "
+        knowledge_base,
+        {"empty", "snapshot_sha256", "document_count", "domains"},
+        "run.json.knowledge_base ",
     )
     require_exact_fields(apply_value, {"status", "entries"}, "run.json.apply ")
     if (
         not isinstance(input_value["path"], str)
+        or not input_value["path"]
         or not isinstance(input_value["sha256"], str)
+        or not SHA256_PATTERN.fullmatch(input_value["sha256"])
+        or not isinstance(input_value["type"], str)
+        or input_value["type"] not in {"json_file", "zip_archive", "directory"}
+        or not isinstance(input_value["branch_policy"], str)
         or input_value["branch_policy"] not in {"active", "all"}
+        or not isinstance(input_value["sources"], list)
+        or not input_value["sources"]
     ):
         raise RunError("run.json.input 字段类型或取值无效")
+    source_identities: set[tuple[str, str, str | None]] = set()
+    for index, source_record in enumerate(input_value["sources"]):
+        context = f"run.json.input.sources[{index}]"
+        if not isinstance(source_record, dict):
+            raise RunError(f"{context} 必须是对象")
+        require_exact_fields(
+            source_record,
+            {"kind", "path", "member_path", "sha256", "size_bytes"},
+            f"{context} ",
+        )
+        kind = source_record["kind"]
+        member_path = source_record["member_path"]
+        if (
+            not isinstance(kind, str)
+            or kind not in {"json_file", "zip_member"}
+            or not isinstance(source_record["path"], str)
+            or not source_record["path"]
+            or not Path(source_record["path"]).is_absolute()
+            or not isinstance(source_record["sha256"], str)
+            or not SHA256_PATTERN.fullmatch(source_record["sha256"])
+            or type(source_record["size_bytes"]) is not int
+            or source_record["size_bytes"] < 0
+            or (kind == "json_file" and member_path is not None)
+            or (
+                kind == "zip_member"
+                and (not isinstance(member_path, str) or not member_path)
+            )
+        ):
+            raise RunError(f"{context} 字段类型或取值无效")
+        identity = (
+            str(kind), str(source_record["path"]),
+            str(member_path) if member_path is not None else None,
+        )
+        if identity in source_identities:
+            raise RunError(f"{context} 来源身份重复")
+        source_identities.add(identity)
+    if input_value["sha256"] != aggregate_source_sha256(input_value["sources"]):
+        raise RunError("run.json.input.sha256 与来源清单不一致")
     if (
-        not isinstance(parsing["conversation_count"], int)
-        or not isinstance(parsing["message_count"], int)
+        type(parsing["conversation_count"]) is not int
+        or parsing["conversation_count"] < 1
+        or type(parsing["message_count"]) is not int
+        or parsing["message_count"] < 1
         or not isinstance(parsing["warnings"], list)
         or not isinstance(parsing["batches"], list)
+        or not parsing["batches"]
     ):
         raise RunError("run.json.parsing 字段类型无效")
+    seen_conversations: set[tuple[str, str]] = set()
+    seen_messages: set[tuple[str, str, str]] = set()
+    for batch_index, batch in enumerate(parsing["batches"]):
+        context = f"run.json.parsing.batches[{batch_index}]"
+        if not isinstance(batch, dict):
+            raise RunError(f"{context} 必须是对象")
+        require_exact_fields(
+            batch,
+            {
+                "index", "conversation_count", "message_count",
+                "estimated_tokens", "conversations",
+            },
+            f"{context} ",
+        )
+        if (
+            not all(
+                type(batch[name]) is int and batch[name] >= 0
+                for name in (
+                    "index", "conversation_count", "message_count",
+                    "estimated_tokens",
+                )
+            )
+            or not isinstance(batch["conversations"], list)
+            or batch["index"] != batch_index + 1
+            or not 1 <= batch["estimated_tokens"] <= DEFAULT_BATCH_TOKEN_BUDGET
+        ):
+            raise RunError(f"{context} 字段类型无效")
+        batch_conversations: set[tuple[str, str]] = set()
+        batch_message_count = 0
+        batch_estimated_tokens = 0
+        for ref_index, ref in enumerate(batch["conversations"]):
+            ref_context = f"{context}.conversations[{ref_index}]"
+            if not isinstance(ref, dict):
+                raise RunError(f"{ref_context} 必须是对象")
+            require_exact_fields(
+                ref,
+                {
+                    "source_sha256", "conversation_id", "message_ids",
+                    "message_count", "estimated_tokens",
+                },
+                f"{ref_context} ",
+            )
+            if (
+                not isinstance(ref["source_sha256"], str)
+                or not SHA256_PATTERN.fullmatch(ref["source_sha256"])
+                or not isinstance(ref["conversation_id"], str)
+                or not ref["conversation_id"]
+                or not isinstance(ref["message_ids"], list)
+                or not ref["message_ids"]
+                or not all(
+                    isinstance(message_id, str) and message_id
+                    for message_id in ref["message_ids"]
+                )
+                or len(set(ref["message_ids"])) != len(ref["message_ids"])
+                or ref["message_count"] != len(ref["message_ids"])
+                or type(ref["estimated_tokens"]) is not int
+                or not 1 <= ref["estimated_tokens"] <= DEFAULT_BATCH_TOKEN_BUDGET
+            ):
+                raise RunError(f"{ref_context} 字段类型或取值无效")
+            conversation_key = (
+                str(ref["source_sha256"]), str(ref["conversation_id"])
+            )
+            batch_conversations.add(conversation_key)
+            seen_conversations.add(conversation_key)
+            for message_id in ref["message_ids"]:
+                message_key = (*conversation_key, str(message_id))
+                if message_key in seen_messages:
+                    raise RunError(f"{ref_context} 重复引用可见消息：{message_id}")
+                seen_messages.add(message_key)
+            batch_message_count += int(ref["message_count"])
+            batch_estimated_tokens += int(ref["estimated_tokens"])
+        if (
+            batch["conversation_count"] != len(batch_conversations)
+            or batch["message_count"] != batch_message_count
+            or batch["estimated_tokens"] != batch_estimated_tokens
+        ):
+            raise RunError(f"{context} 汇总计数与对话引用不一致")
+    if (
+        parsing["conversation_count"] != len(seen_conversations)
+        or parsing["message_count"] != len(seen_messages)
+    ):
+        raise RunError("run.json.parsing 汇总计数与批次引用不一致")
     if (
         not isinstance(knowledge_base["empty"], bool)
         or not isinstance(knowledge_base["snapshot_sha256"], str)
+        or not SHA256_PATTERN.fullmatch(knowledge_base["snapshot_sha256"])
+        or type(knowledge_base["document_count"]) is not int
+        or knowledge_base["document_count"] < 0
+        or not isinstance(knowledge_base["domains"], list)
+        or not all(
+            isinstance(domain, str) and domain
+            for domain in knowledge_base["domains"]
+        )
+        or knowledge_base["empty"] != (knowledge_base["document_count"] == 0)
+        or len(set(knowledge_base["domains"])) != len(knowledge_base["domains"])
     ):
         raise RunError("run.json.knowledge_base 字段类型无效")
     if not isinstance(apply_value["status"], str) or not isinstance(
@@ -658,7 +960,10 @@ def current_view(
     if branch not in {"active", "all"}:
         raise RunError("run.json.input.branch_policy 无效")
     view, metadata = collect_visible_view(source, str(branch))
-    if metadata["input_sha256"] != input_value.get("sha256"):
+    if (
+        metadata["input_sha256"] != input_value.get("sha256")
+        or metadata["sources"] != input_value.get("sources")
+    ):
         raise RunError("原始输入内容已变化，请创建新的 run")
     return view, metadata
 
@@ -666,34 +971,48 @@ def current_view(
 def select_batch(
     view: dict[str, object], document: dict[str, object], batch_index: int | None
 ) -> dict[str, object]:
-    """按 run 中的引用返回一个批次，或返回全部小输入。"""
+    """按消息引用返回预算内批次；多批输入禁止一次读取全部内容。"""
 
-    if batch_index is None:
-        return view
     parsing = document["parsing"]
     assert isinstance(parsing, dict)
     batches = parsing.get("batches")
+    if not isinstance(batches, list) or not batches:
+        raise RunError("run.json.parsing.batches 必须是非空数组")
+    if batch_index is None:
+        if len(batches) > 1:
+            raise RunError("输入包含多个批次，必须使用 read-input --batch N 逐批读取")
+        batch_index = 1
     if not isinstance(batches, list) or not 1 <= batch_index <= len(batches):
         raise RunError("batch 超出可用范围")
     batch = batches[batch_index - 1]
     assert isinstance(batch, dict)
-    refs = {
-        (str(item["source_sha256"]), str(item["conversation_id"]))
-        for item in batch["conversations"]
-        if isinstance(item, dict)
-    }
+    refs: dict[tuple[str, str], set[str]] = {}
+    for item in batch["conversations"]:
+        if not isinstance(item, dict) or not isinstance(item.get("message_ids"), list):
+            raise RunError("批次对话引用无效")
+        key = (str(item["source_sha256"]), str(item["conversation_id"]))
+        refs.setdefault(key, set()).update(str(value) for value in item["message_ids"])
     selected_sources: list[dict[str, object]] = []
     for source_item in view["sources"]:
         assert isinstance(source_item, dict)
-        conversations = [
-            conversation
-            for conversation in source_item["conversations"]
-            if (
+        conversations: list[dict[str, object]] = []
+        for conversation in source_item["conversations"]:
+            key = (
                 str(conversation["source_sha256"]),
                 str(conversation["conversation_id"]),
             )
-            in refs
-        ]
+            if key not in refs:
+                continue
+            selected_ids = refs[key]
+            selected_messages = [
+                message
+                for message in conversation["messages"]
+                if str(message["message_id"]) in selected_ids
+            ]
+            if selected_messages:
+                conversations.append(
+                    {**conversation, "messages": selected_messages}
+                )
         if conversations:
             selected_sources.append(
                 {"source": source_item["source"], "conversations": conversations}
@@ -703,6 +1022,7 @@ def select_batch(
         "branch_policy": view["branch_policy"],
         "batch": batch_index,
         "batch_count": len(batches),
+        "estimated_tokens": batch["estimated_tokens"],
         "sources": selected_sources,
     }
 
@@ -775,6 +1095,93 @@ def unified_diff(before: bytes, after: bytes, target_path: str) -> str:
             tofile=f"b/{target_path}",
         )
     )
+
+
+def diff_summary(before: bytes, after: bytes, target_path: str) -> dict[str, object]:
+    """返回更新文档的确定性轻量差异摘要，不重复输出完整正文。"""
+
+    import difflib
+
+    before_text = decode_markdown(before, target_path)
+    after_text = decode_markdown(after, target_path)
+    before_lines = before_text.splitlines()
+    after_lines = after_text.splitlines()
+    matcher = difflib.SequenceMatcher(
+        None,
+        before_lines,
+        after_lines,
+        autojunk=False,
+    )
+    added_line_count = 0
+    removed_line_count = 0
+    for (
+        operation,
+        before_start,
+        before_end,
+        after_start,
+        after_end,
+    ) in matcher.get_opcodes():
+        if operation in {"replace", "delete"}:
+            removed_line_count += before_end - before_start
+        if operation in {"replace", "insert"}:
+            added_line_count += after_end - after_start
+
+    before_headings = [
+        (heading.level, heading.text)
+        for heading in knowledge_inventory.parse_headings(before_text)
+    ]
+    after_headings = [
+        (heading.level, heading.text)
+        for heading in knowledge_inventory.parse_headings(after_text)
+    ]
+
+    def heading_difference(
+        primary: list[tuple[int, str]],
+        secondary: list[tuple[int, str]],
+    ) -> list[dict[str, object]]:
+        """按出现次数和原顺序计算单向标题差集。"""
+
+        remaining = list(secondary)
+        difference: list[dict[str, object]] = []
+        for level, text in primary:
+            try:
+                remaining.remove((level, text))
+            except ValueError:
+                difference.append({"level": level, "text": text})
+        return difference
+
+    before_sections = {
+        (fragment.heading_path, fragment.ordinal): fragment.markdown
+        for fragment in knowledge_inventory.parse_section_fragments(
+            before_text,
+            target_path,
+        )
+    }
+    after_sections = {
+        (fragment.heading_path, fragment.ordinal): fragment.markdown
+        for fragment in knowledge_inventory.parse_section_fragments(
+            after_text,
+            target_path,
+        )
+    }
+    changed_sections = [
+        {
+            "heading_path": list(heading_path),
+            "ordinal": ordinal,
+        }
+        for (heading_path, ordinal), markdown in after_sections.items()
+        if (heading_path, ordinal) in before_sections
+        and before_sections[(heading_path, ordinal)] != markdown
+    ]
+    return {
+        "before_line_count": len(before_lines),
+        "after_line_count": len(after_lines),
+        "added_line_count": added_line_count,
+        "removed_line_count": removed_line_count,
+        "added_headings": heading_difference(after_headings, before_headings),
+        "removed_headings": heading_difference(before_headings, after_headings),
+        "changed_sections": changed_sections,
+    }
 
 
 def document_outline(text: str) -> dict[str, object]:
@@ -861,7 +1268,7 @@ def prepare_review(
             "sources": source_map[target_path],
         }
         outputs.append(output)
-        include_diff = target.exists() or full_diff
+        include_diff = full_diff
         review_item: dict[str, object] = {
             "target_path": target_path,
             "proposed_path": output["proposed_path"],
@@ -872,6 +1279,12 @@ def prepare_review(
             "outline": document_outline(text),
             "diff_included": include_diff,
         }
+        if target.exists():
+            review_item["diff_summary"] = diff_summary(
+                before,
+                proposed,
+                target_path,
+            )
         if include_diff:
             review_item["diff"] = unified_diff(before, proposed, target_path)
         review_items.append(review_item)
@@ -1008,6 +1421,7 @@ def apply_outputs(
 
     if document["status"] != "review_ready":
         raise RunError("run 尚未准备好审核，不能应用")
+    ensure_snapshot(knowledge_root, document)
     outputs = document["outputs"]
     assert isinstance(outputs, list)
     expected = [str(output["target_path"]) for output in outputs]
@@ -1057,6 +1471,9 @@ def recover_apply(
 
     state_path = run_root / APPLY_STATE_FILE
     if not state_path.is_file():
+        apply_value = document.get("apply")
+        if isinstance(apply_value, dict) and apply_value.get("status") == "recovered":
+            return {"status": "already_recovered", "restored_file_count": 0}
         raise RunError("没有可恢复的应用状态")
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -1128,6 +1545,8 @@ def execute_command(args: argparse.Namespace) -> tuple[dict[str, object], int]:
             "message_count": parsing["message_count"],
             "batch_count": len(parsing["batches"]),
             "knowledge_base_empty": knowledge_base["empty"],
+            "knowledge_base_document_count": knowledge_base["document_count"],
+            "knowledge_base_domains": knowledge_base["domains"],
         }, 0
 
     run_root = resolve_directory(args.run_directory, "run 目录")
@@ -1143,7 +1562,7 @@ def execute_command(args: argparse.Namespace) -> tuple[dict[str, object], int]:
             source,
             run_root,
             document,
-            sys.stdin.read(),
+            read_standard_input(),
             args.full_diff,
         ), 0
     if args.command == "apply":
@@ -1157,7 +1576,7 @@ def create_parser() -> argparse.ArgumentParser:
     """创建唯一公开运行 CLI。"""
 
     parser = argparse.ArgumentParser(
-        description="以单一 run.v2 流程整理 ChatGPT 对话知识。"
+        description="以单一 run.v4 流程整理 ChatGPT 对话知识。"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     init_parser = subparsers.add_parser("init", help="检查输入并创建 run")

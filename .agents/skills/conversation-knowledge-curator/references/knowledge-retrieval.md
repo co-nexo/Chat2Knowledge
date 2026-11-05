@@ -1,6 +1,6 @@
 # knowledge retrieval 内存规则
 
-只在知识库非空、Codex 已从输入识别出主题后调用 `knowledge_run.py context`。它在内存中扫描当前 Markdown 并返回有限相关原文，不生成 inventory 或 retrieval 文件，也不依赖 Candidate ID。
+只在知识库非空、Codex 已从输入识别出上位领域和检索意图后调用 `knowledge_run.py context`。先比较 `init` 返回的 `knowledge_base_domains`：没有合理关联的领域不调用检索；同一领域的相关主题使用重复的 `--query` 在一次命令中组合查询，不为每个原子知识点单独调用。它在内存中扫描当前 Markdown 并返回有限相关原文，不生成 inventory 或 retrieval 文件，也不依赖 Candidate ID。
 
 返回值使用 `conversation-knowledge-curator.context.v1`，主要字段如下：
 
@@ -43,5 +43,5 @@
 
 ## 输入与安全校验
 
-`context` 必须先确认知识库快照仍与 `run.json` 一致，拒绝路径越界和链接。空知识库返回 `skipped_empty_knowledge_base`，不执行检索。`--limit` 允许 1 到 20；结果只帮助 Codex决定读取范围，不能自动决定融合或写入。
+`context` 必须先确认知识库快照仍与 `run.json` 一致，拒绝路径越界和链接。空知识库返回 `skipped_empty_knowledge_base`，不执行检索。`--limit` 允许 1 到 20；结果只帮助 Codex 决定读取范围，不能自动决定领域归属、融合或写入。
 

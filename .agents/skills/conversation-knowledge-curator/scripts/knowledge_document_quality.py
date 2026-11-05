@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""检查知识文档的标题层级与编号等确定性质量规则。"""
+"""供统一运行时检查 Markdown 标题与编号的确定性内部库。"""
 
 from __future__ import annotations
 
-import argparse
 import re
-import sys
 from pathlib import Path
 
 import knowledge_inventory
@@ -232,35 +230,4 @@ def check_file(path: Path, mode: str) -> dict[str, object]:
     except (OSError, knowledge_inventory.InventoryError) as exc:
         raise DocumentQualityError(f"无法读取 Markdown：{path}：{exc}") from exc
     return analyze_document(text, mode, str(path.resolve()))
-
-
-def create_parser() -> argparse.ArgumentParser:
-    """创建中文命令行解析器。"""
-
-    parser = argparse.ArgumentParser(
-        description="检查知识文档的标题层级与编号，不修改原文件。"
-    )
-    parser.add_argument("command", choices=("check",))
-    parser.add_argument("markdown_file", type=Path)
-    parser.add_argument(
-        "--mode",
-        choices=sorted(CHECK_MODES),
-        default="strict",
-        help="strict 用于新建文档；compatible 用于既有文档。",
-    )
-    return parser
-
-
-def main(argv: list[str] | None = None) -> int:
-    """执行只读检查；质量不合格或输入失败时返回 2。"""
-
-    parser = create_parser()
-    args = parser.parse_args(argv)
-    try:
-        report = check_file(args.markdown_file, args.mode)
-    except DocumentQualityError as exc:
-        print(f"错误：{exc}", file=sys.stderr)
-        return 2
-    print(knowledge_inventory.serialize_json(report), end="")
-    return 0 if report["status"] == "ok" else 2
 

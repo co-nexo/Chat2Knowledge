@@ -15,26 +15,12 @@
 5. 被识别的链接会跳过并形成结构化警告，不进入扫描结果。
 6. 在系统允许时使用真实目录链接验证不会跟随到知识库外部。
 
-已覆盖的输出写入行为：
-
-1. 非 UTF-8 输入失败时不创建正式输出。
-2. 已存在输出不会被覆盖或改变。
-3. 输出父目录不存在时失败且不留下半成品。
-
-已覆盖的 CLI 行为：
-
-1. 成功时写入 inventory，并在标准输出返回结构化汇总。
-2. 失败时返回退出码 2、诊断写入标准错误且不创建输出。
-3. 存在警告时返回退出码 1 和 `completed_with_issues`。
-
 """
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import importlib.util
-import io
 import json
 import sys
 import tempfile
@@ -284,131 +270,6 @@ class InventoryBuildTests(unittest.TestCase):
             self.assertEqual(
                 inventory["warnings"][0]["path"],
                 "external-link",
-            )
-
-
-class InventoryWriteTests(unittest.TestCase):
-
-    def test_invalid_utf8_fails_without_output(self) -> None:
-        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
-            root = Path(directory)
-            knowledge_root = root / "knowledge"
-            knowledge_root.mkdir()
-            (knowledge_root / "invalid.md").write_bytes(b"\xff\xfe")
-            output = root / "inventory.json"
-
-            with self.assertRaises(knowledge_inventory.InventoryError):
-                knowledge_inventory.create_inventory_file(
-                    knowledge_root,
-                    output,
-                )
-
-            self.assertFalse(output.exists())
-
-    def test_existing_output_is_never_overwritten(self) -> None:
-        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
-            output = Path(directory) / "inventory.json"
-            output.write_text("keep", encoding="utf-8")
-
-            with self.assertRaises(knowledge_inventory.InventoryError):
-                knowledge_inventory.create_inventory_file(
-                    FIXTURE_ROOT,
-                    output,
-                )
-
-            self.assertEqual(output.read_text(encoding="utf-8"), "keep")
-
-    def test_output_parent_must_exist(self) -> None:
-        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
-            output = Path(directory) / "missing" / "inventory.json"
-
-            with self.assertRaises(knowledge_inventory.InventoryError):
-                knowledge_inventory.create_inventory_file(
-                    FIXTURE_ROOT,
-                    output,
-                )
-
-            self.assertFalse(output.exists())
-
-
-class InventoryCliTests(unittest.TestCase):
-
-    def test_cli_writes_inventory_and_returns_summary(self) -> None:
-        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
-            output = Path(directory) / "inventory.json"
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-
-            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
-                stderr
-            ):
-                exit_code = knowledge_inventory.main(
-                    ["inventory", str(FIXTURE_ROOT), str(output)]
-                )
-
-            self.assertEqual(exit_code, 0)
-            self.assertEqual(stderr.getvalue(), "")
-            summary = json.loads(stdout.getvalue())
-            document = json.loads(output.read_text(encoding="utf-8"))
-            self.assertEqual(summary["status"], "ok")
-            self.assertEqual(summary["file_count"], 3)
-            self.assertEqual(summary["warning_count"], 0)
-            self.assertEqual(
-                document["format"],
-                "conversation-knowledge-curator.knowledge-inventory.v1",
-            )
-
-    def test_cli_failure_does_not_create_output(self) -> None:
-        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
-            root = Path(directory)
-            output = root / "inventory.json"
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-
-            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
-                stderr
-            ):
-                exit_code = knowledge_inventory.main(
-                    ["inventory", str(root / "missing"), str(output)]
-                )
-
-            self.assertEqual(exit_code, 2)
-            self.assertEqual(stdout.getvalue(), "")
-            self.assertTrue(stderr.getvalue().strip())
-            self.assertFalse(output.exists())
-
-    def test_cli_returns_one_for_completed_with_issues(self) -> None:
-        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
-            root = Path(directory)
-            output = root / "inventory.json"
-            stdout = io.StringIO()
-            with mock.patch.object(
-                knowledge_inventory,
-                "create_inventory_file",
-                return_value={
-                    "format": (
-                        "conversation-knowledge-curator."
-                        "knowledge-inventory.v1"
-                    ),
-                    "status": "completed_with_issues",
-                    "files": [],
-                    "warnings": [
-                        {
-                            "code": "link_skipped",
-                            "path": "linked",
-                            "message": "synthetic warning",
-                        }
-                    ],
-                },
-            ), contextlib.redirect_stdout(stdout):
-                exit_code = knowledge_inventory.main(
-                    ["inventory", str(root), str(output)]
-                )
-
-            self.assertEqual(exit_code, 1)
-            self.assertEqual(
-                json.loads(stdout.getvalue())["status"],
-                "completed_with_issues",
             )
 
 

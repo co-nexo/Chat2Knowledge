@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
-"""检查并标准化 ChatGPT 对话导出 JSON。
+"""供统一运行时调用的 ChatGPT 导出检查与内存标准化核心。
 
-本模块只使用 Python 标准库。它不会修改输入文件，只会新建标准化输出；
-如果目标文件已经存在，则视为错误。
+本模块只使用 Python 标准库，不修改原始输入，也不直接暴露 CLI。
 """
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import json
+import os
 import re
-import sys
 import zipfile
 from collections import Counter
 from dataclasses import dataclass
@@ -21,7 +19,6 @@ from typing import Any
 
 FORMAT_VERSION = "conversation-knowledge-curator.normalized.v3"
 INSPECTION_FORMAT_VERSION = "conversation-knowledge-curator.inspection.v1"
-MANIFEST_FORMAT_VERSION = "conversation-knowledge-curator.manifest.v1"
 ELIGIBLE_ROLES = {"user", "assistant"}
 HIDDEN_CONTENT_TYPES = {
     "analysis",
@@ -93,6 +90,16 @@ class ExportError(ValueError):
 
 class InputSafetyError(ExportError):
     """输入超过安全限制或包含不安全路径时抛出。"""
+
+
+def path_is_link_like(path: Path) -> bool:
+    """识别符号链接和 Windows 目录联接，避免目录扫描越界。"""
+
+    try:
+        is_junction = getattr(path, "is_junction", None)
+        return path.is_symlink() or bool(is_junction and is_junction())
+    except OSError:
+        return True
 
 
 def archive_member_is_safe(member_name: str) -> bool:
@@ -271,43 +278,60 @@ def resolve_input(
             )
     elif path.is_dir():
         input_type = "directory"
-        try:
-            entries = sorted(
-                path.rglob("*"),
-                key=lambda entry: entry.relative_to(path).as_posix().casefold(),
-            )
-        except OSError as exc:
-            raise ExportError(f"无法扫描输入目录 {path}：{exc}") from exc
+        scan_errors: list[OSError] = []
 
-        for entry in entries:
-            if entry.is_symlink():
-                warnings.append(f"跳过符号链接：{entry}")
-                continue
-            try:
-                if not entry.is_file():
-                    continue
-                suffix = entry.suffix.lower()
-                if suffix == ".json":
-                    sources.append(
-                        InputSource(
-                            kind="json_file",
-                            path=entry,
-                            size_bytes=entry.stat().st_size,
-                        )
-                    )
-                    json_file_count += 1
-                elif suffix == ".zip":
-                    archive_sources, archive_report, archive_warnings = (
-                        discover_archive_sources(entry, limits)
-                    )
-                    sources.extend(archive_sources)
-                    archives.append(archive_report)
-                    warnings.extend(archive_warnings)
-                    zip_file_count += 1
+        def record_scan_error(error: OSError) -> None:
+            scan_errors.append(error)
+
+        for current_text, directory_names, file_names in os.walk(
+            path,
+            topdown=True,
+            onerror=record_scan_error,
+            followlinks=False,
+        ):
+            current = Path(current_text)
+            directory_names.sort(key=str.casefold)
+            file_names.sort(key=str.casefold)
+            safe_directories: list[str] = []
+            for directory_name in directory_names:
+                child = current / directory_name
+                if path_is_link_like(child):
+                    warnings.append(f"跳过链接目录：{child}")
                 else:
-                    other_file_count += 1
-            except OSError as exc:
-                warnings.append(f"无法检查文件 {entry}：{exc}")
+                    safe_directories.append(directory_name)
+            directory_names[:] = safe_directories
+
+            for file_name in file_names:
+                entry = current / file_name
+                if path_is_link_like(entry):
+                    warnings.append(f"跳过链接文件：{entry}")
+                    continue
+                try:
+                    if not entry.is_file():
+                        continue
+                    suffix = entry.suffix.lower()
+                    if suffix == ".json":
+                        sources.append(
+                            InputSource(
+                                kind="json_file",
+                                path=entry,
+                                size_bytes=entry.stat().st_size,
+                            )
+                        )
+                        json_file_count += 1
+                    elif suffix == ".zip":
+                        archive_sources, archive_report, archive_warnings = (
+                            discover_archive_sources(entry, limits)
+                        )
+                        sources.extend(archive_sources)
+                        archives.append(archive_report)
+                        warnings.extend(archive_warnings)
+                        zip_file_count += 1
+                    else:
+                        other_file_count += 1
+                except OSError as exc:
+                    warnings.append(f"无法检查文件 {entry}：{exc}")
+        warnings.extend(f"无法扫描目录项：{error}" for error in scan_errors)
     else:
         raise ExportError(f"输入路径既不是普通文件也不是目录：{path}")
 
@@ -1026,217 +1050,3 @@ def normalize_source(
     data = json.loads(payload.decode("utf-8-sig"))
     inspect_loaded_export(data, descriptor)
     return normalize_loaded_export(data, descriptor, branch)
-
-
-def normalized_output_filename(source: InputSource) -> str:
-    """根据来源身份生成稳定且适合 Windows 的唯一输出文件名。"""
-
-    if source.kind == "zip_member":
-        member = PurePosixPath((source.member_path or "source.json").replace("\\", "/"))
-        label = f"{source.path.stem}__{'__'.join(member.with_suffix('').parts)}"
-        identity = f"zip_member\0{source.path}\0{source.member_path}"
-    else:
-        label = source.path.stem
-        identity = f"json_file\0{source.path}"
-
-    safe_label = re.sub(r"[^\w.-]+", "_", label, flags=re.UNICODE).strip("._")
-    safe_label = (safe_label or "source")[:96]
-    identity_hash = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:10]
-    return f"{safe_label}--{identity_hash}.normalized.json"
-
-
-def normalize_input(
-    input_path: Path,
-    output_directory: Path,
-    branch: str = "active",
-    limits: InspectionLimits = DEFAULT_INSPECTION_LIMITS,
-) -> dict[str, Any]:
-    """批量标准化受支持来源，并在新目录中写入结果和 manifest。"""
-
-    output_path = output_directory.expanduser().resolve()
-    if output_path.exists():
-        raise ExportError(f"输出目录已存在，拒绝覆盖或追加：{output_path}")
-
-    resolved = resolve_input(input_path, limits)
-    inspections = [inspect_source(source, limits) for source in resolved.sources]
-    supported_count = sum(
-        inspection.get("status") == "supported" for inspection in inspections
-    )
-    if supported_count == 0:
-        raise ExportError("没有通过 inspect 的受支持 JSON 来源，不生成标准化输出")
-
-    output_path.mkdir(parents=True, exist_ok=False)
-    entries: list[dict[str, Any]] = []
-    normalized_source_count = 0
-    skipped_source_count = 0
-    failed_source_count = 0
-    normalized_conversation_count = 0
-    skipped_conversation_count = 0
-    message_count = 0
-    normalization_warning_count = 0
-
-    for source, inspection in zip(resolved.sources, inspections, strict=True):
-        if inspection.get("status") != "supported":
-            skipped_source_count += 1
-            entries.append(
-                {
-                    "status": "skipped",
-                    "source": inspection.get("source", source_descriptor(source)),
-                    "inspection_status": inspection.get("status"),
-                    "reason": inspection.get("error"),
-                }
-            )
-            continue
-
-        output_name = normalized_output_filename(source)
-        try:
-            result = normalize_source(source, branch, limits, inspection)
-            write_new_json(output_path / output_name, result.document)
-        except (
-            ExportError,
-            FileExistsError,
-            json.JSONDecodeError,
-            UnicodeError,
-            OSError,
-        ) as exc:
-            failed_source_count += 1
-            entries.append(
-                {
-                    "status": "failed",
-                    "source": inspection["source"],
-                    "reason": str(exc),
-                }
-            )
-            continue
-
-        normalization = result.diagnostics
-        normalized_source_count += 1
-        normalized_conversation_count += normalization[
-            "normalized_conversation_count"
-        ]
-        skipped_conversation_count += normalization["skipped_conversation_count"]
-        message_count += normalization["message_count"]
-        normalization_warning_count += len(normalization["warnings"])
-        entries.append(
-            {
-                "status": "normalized",
-                "source": result.source,
-                "output": output_name,
-                "normalization": normalization,
-            }
-        )
-
-    has_issues = any(
-        (
-            skipped_source_count,
-            failed_source_count,
-            skipped_conversation_count,
-            normalization_warning_count,
-            resolved.warnings,
-            any(archive.get("status") != "ok" for archive in resolved.archives),
-        )
-    )
-    manifest = {
-        "format": MANIFEST_FORMAT_VERSION,
-        "status": "completed_with_issues" if has_issues else "ok",
-        "input": {
-            "path": str(resolved.input_path),
-            "type": resolved.input_type,
-        },
-        "output_directory": str(output_path),
-        "branch_policy": branch,
-        "discovery": {
-            "json_file_count": resolved.json_file_count,
-            "zip_file_count": resolved.zip_file_count,
-            "other_file_count": resolved.other_file_count,
-            "candidate_json_count": len(resolved.sources),
-        },
-        "archives": list(resolved.archives),
-        "summary": {
-            "candidate_source_count": len(resolved.sources),
-            "normalized_source_count": normalized_source_count,
-            "skipped_source_count": skipped_source_count,
-            "failed_source_count": failed_source_count,
-            "normalized_conversation_count": normalized_conversation_count,
-            "skipped_conversation_count": skipped_conversation_count,
-            "message_count": message_count,
-            "normalization_warning_count": normalization_warning_count,
-        },
-        "entries": entries,
-        "warnings": list(resolved.warnings),
-    }
-    write_new_json(output_path / "manifest.json", manifest)
-    return manifest
-
-
-def normalization_exit_code(manifest: dict[str, Any]) -> int:
-    """根据批量标准化结果返回适合自动化调用的退出码。"""
-
-    return 0 if manifest.get("status") == "ok" else 1
-
-
-def write_new_json(path: Path, value: Any) -> None:
-    """把值写入新的 JSON 文件；目标已存在时拒绝覆盖。"""
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("x", encoding="utf-8", newline="\n") as handle:
-        json.dump(value, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-
-
-def build_parser() -> argparse.ArgumentParser:
-    """构建命令行参数解析器。"""
-
-    parser = argparse.ArgumentParser(
-        description="检查或标准化 ChatGPT 对话导出 JSON。"
-    )
-    subparsers = parser.add_subparsers(dest="command", required=True)
-    inspect_parser = subparsers.add_parser(
-        "inspect", help="检查 JSON、ZIP 或目录并输出结构报告"
-    )
-    inspect_parser.add_argument(
-        "input",
-        type=Path,
-        help="待检查的 JSON 文件、ZIP 压缩包或目录",
-    )
-
-    normalize_parser = subparsers.add_parser(
-        "normalize", help="把受支持的 JSON、ZIP 或目录标准化到新目录"
-    )
-    normalize_parser.add_argument(
-        "input", type=Path, help="待标准化的 JSON、ZIP 或目录"
-    )
-    normalize_parser.add_argument(
-        "output", type=Path, help="必须尚不存在的新输出目录"
-    )
-    normalize_parser.add_argument(
-        "--branch",
-        choices=("active", "all"),
-        default="active",
-        help="分支选择策略：active 为当前分支，all 为全部分支",
-    )
-    return parser
-
-
-def main(argv: list[str] | None = None) -> int:
-    """执行命令行入口，并把可预期错误转换为非零退出码。"""
-
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    try:
-        if args.command == "inspect":
-            report = inspect_input(args.input)
-            json.dump(report, sys.stdout, ensure_ascii=False, indent=2)
-            sys.stdout.write("\n")
-            return inspection_exit_code(report)
-        else:
-            if args.input.resolve() == args.output.resolve():
-                raise ExportError("输出路径必须与输入路径不同")
-            manifest = normalize_input(args.input, args.output, args.branch)
-            json.dump(manifest, sys.stdout, ensure_ascii=False, indent=2)
-            sys.stdout.write("\n")
-            return normalization_exit_code(manifest)
-    except (ExportError, FileExistsError, json.JSONDecodeError, OSError) as exc:
-        parser.exit(2, f"错误：{exc}\n")
-    return 0
-

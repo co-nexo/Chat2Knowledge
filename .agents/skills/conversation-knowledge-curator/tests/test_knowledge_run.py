@@ -10,13 +10,14 @@
 
 1. run manifest 必须使用当前格式和固定字段，未知字段会被拒绝。
 2. 移动 run 或篡改知识库根目录会被拒绝。
-3. 唯一公开 CLI 已切换到 v2，不再暴露 inspect 与 normalize 阶段。
+3. 唯一公开 CLI 使用 run.v4，不再暴露 inspect 与 normalize 阶段。
+4. 旧 Candidate、Proposal、Review 和 Apply 编排脚本不再存在。
 
 已覆盖的 CLI 行为：
 
 1. init 与 read-input 返回结构化摘要，且不落盘标准化内容。
 2. 失败返回退出码 2，且不会在知识库同级创建派生目录。
-3. apply 与 recover 返回 v2 核心的实际应用和恢复数量。
+3. apply 与 recover 返回 v4 核心的实际应用和恢复数量。
 """
 
 from __future__ import annotations
@@ -71,6 +72,26 @@ def create_inputs(root: Path) -> tuple[Path, Path]:
     return knowledge_root, input_path
 
 
+class RunArchitectureTests(unittest.TestCase):
+    def test_only_knowledge_run_is_directly_executable(self) -> None:
+        entrypoints = sorted(
+            path.name
+            for path in SCRIPTS_DIR.glob("*.py")
+            if 'if __name__ == "__main__"' in path.read_text(encoding="utf-8")
+        )
+
+        self.assertEqual(entrypoints, ["knowledge_run.py"])
+
+    def test_legacy_pipeline_scripts_are_absent(self) -> None:
+        for name in (
+            "knowledge_candidates.py",
+            "knowledge_proposals.py",
+            "knowledge_review.py",
+            "knowledge_apply.py",
+        ):
+            self.assertFalse((SCRIPTS_DIR / name).exists(), name)
+
+
 class RunInitializationTests(unittest.TestCase):
     def test_init_creates_only_fixed_parent_layout(self) -> None:
         with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
@@ -92,7 +113,7 @@ class RunInitializationTests(unittest.TestCase):
             )
             self.assertEqual(
                 document["format"],
-                "conversation-knowledge-curator.run.v2",
+                "conversation-knowledge-curator.run.v4",
             )
             self.assertTrue((run_root / "run.json").is_file())
             self.assertTrue((run_root / "proposed").is_dir())
@@ -201,7 +222,7 @@ class RunCliTests(unittest.TestCase):
             exit_code = knowledge_run.main(argv)
         return exit_code, stdout.getvalue(), stderr.getvalue()
 
-    def test_cli_v2_reads_input_without_normalized_output(self) -> None:
+    def test_cli_v4_reads_input_without_normalized_output(self) -> None:
         with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
             root = Path(directory)
             knowledge_root, input_path = create_inputs(root)

@@ -7,20 +7,12 @@
 3. 兼容模式允许既有文档保留未编号章节，但仍拒绝 H1 和层级结构损坏。
 4. 代码围栏中的井号不会被误判为知识文档标题。
 
-已覆盖的 CLI 行为：
-
-1. 合格文档输出结构化报告并返回 0。
-2. 不合格文档输出失败报告并返回 2，且不修改原文件。
 """
 
 from __future__ import annotations
 
-import contextlib
 import importlib.util
-import io
-import json
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 
@@ -132,48 +124,6 @@ class DocumentStructureTests(unittest.TestCase):
 
         self.assertEqual(report["status"], "ok")
         self.assertEqual(report["summary"]["heading_count"], 2)
-
-
-class DocumentQualityCliTests(unittest.TestCase):
-    def test_cli_reports_success_without_modifying_source(self) -> None:
-        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
-            path = Path(directory) / "knowledge.md"
-            original = "# 合成主题\n\n## 1. 正式章节\n\n正文。\n"
-            path.write_text(original, encoding="utf-8")
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-
-            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
-                stderr
-            ):
-                exit_code = knowledge_document_quality.main(
-                    ["check", str(path), "--mode", "strict"]
-                )
-
-            self.assertEqual(exit_code, 0, stderr.getvalue())
-            self.assertEqual(stderr.getvalue(), "")
-            self.assertEqual(json.loads(stdout.getvalue())["status"], "ok")
-            self.assertEqual(path.read_text(encoding="utf-8"), original)
-
-    def test_cli_returns_two_for_quality_failure(self) -> None:
-        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
-            path = Path(directory) / "knowledge.md"
-            original = "# 合成主题\n\n## 未编号章节\n\n正文。\n"
-            path.write_text(original, encoding="utf-8")
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-
-            with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(
-                stderr
-            ):
-                exit_code = knowledge_document_quality.main(
-                    ["check", str(path), "--mode", "strict"]
-                )
-
-            self.assertEqual(exit_code, 2)
-            self.assertEqual(stderr.getvalue(), "")
-            self.assertEqual(json.loads(stdout.getvalue())["status"], "failed")
-            self.assertEqual(path.read_text(encoding="utf-8"), original)
 
 
 if __name__ == "__main__":
