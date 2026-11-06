@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""实现 conversation-knowledge-curator.run.v6 的单流程运行核心。"""
+"""实现 conversation-knowledge-curator.run.v8 的单流程运行核心。"""
 
 from __future__ import annotations
 
@@ -21,11 +21,13 @@ import knowledge_document_quality
 import knowledge_inventory
 import knowledge_retrieval
 
-FORMAT_VERSION = "conversation-knowledge-curator.run.v6"
+FORMAT_VERSION = "conversation-knowledge-curator.run.v8"
 VISIBLE_FORMAT = "conversation-knowledge-curator.visible-input.v3"
 CONTEXT_FORMAT = "conversation-knowledge-curator.context.v1"
-REVIEW_FORMAT = "conversation-knowledge-curator.review.v3"
-REVIEW_INPUT_FORMAT = "conversation-knowledge-curator.review-input.v2"
+REVIEW_FORMAT = "conversation-knowledge-curator.review.v5"
+REVIEW_INPUT_FORMAT = "conversation-knowledge-curator.review-input.v3"
+LOCAL_SETTINGS_FORMAT = "conversation-knowledge-curator.local-settings.v1"
+INBOX_FORMAT = "conversation-knowledge-curator.inbox.v1"
 RUN_ID_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 RUN_RELATIVE_ROOT = PurePosixPath(".knowledge-curator/runs")
 PROPOSED_DIRECTORY = "proposed"
@@ -45,6 +47,15 @@ ISSUE_KINDS = {
     "assistant_only",
     "other",
 }
+EVIDENCE_KINDS = {
+    "conversation_statement",
+    "official_verification",
+    "engineering_judgment",
+}
+MESSAGE_PREVIEW_CHARS = 240
+DEFAULT_SETTINGS_PATH = (
+    Path(__file__).resolve().parents[4] / ".knowledge-curator.local.json"
+)
 
 
 class RunError(Exception):
@@ -127,6 +138,334 @@ def atomic_write(path: Path, content: bytes) -> None:
     except OSError as exc:
         temporary.unlink(missing_ok=True)
         raise RunError(f"无法安全写入：{path}") from exc
+
+
+def validate_local_settings(document: object) -> dict[str, object]:
+    """校验本地固定目录配置并返回收窄后的对象。"""
+
+    if not isinstance(document, dict):
+        raise RunError("本地配置必须是 JSON 对象")
+    require_exact_fields(
+        document,
+        {"format", "input_dir", "knowledge_root", "branch_policy"},
+        "本地配置",
+    )
+    if document["format"] != LOCAL_SETTINGS_FORMAT:
+        raise RunError(
+            f"不支持的本地配置格式：{document['format']}；"
+            f"当前只支持 {LOCAL_SETTINGS_FORMAT}"
+        )
+    if document["branch_policy"] not in {"active", "all"}:
+        raise RunError("本地配置 branch_policy 只允许 active 或 all")
+    for field in ("input_dir", "knowledge_root"):
+        if not isinstance(document[field], str) or not document[field]:
+            raise RunError(f"本地配置 {field} 必须是非空字符串")
+    return document
+
+
+def load_local_settings(settings_path: Path) -> dict[str, object]:
+    """读取本地固定目录配置，并重新校验两个目录。"""
+
+    if knowledge_inventory.is_link_like(settings_path):
+        raise RunError(f"本地配置不得是链接：{settings_path}")
+    try:
+        document = json.loads(settings_path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise RunError("尚未配置固定目录；请先运行 configure-inbox") from exc
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RunError(f"无法读取本地配置：{settings_path}") from exc
+    settings = validate_local_settings(document)
+    input_dir = resolve_directory(Path(str(settings["input_dir"])), "固定输入目录")
+    knowledge_root = resolve_directory(
+        Path(str(settings["knowledge_root"])), "固定知识库根目录"
+    )
+    return {
+        "format": LOCAL_SETTINGS_FORMAT,
+        "input_dir": str(input_dir),
+        "knowledge_root": str(knowledge_root),
+        "branch_policy": settings["branch_policy"],
+    }
+
+
+def configure_inbox(
+    settings_path: Path,
+    input_dir: Path,
+    knowledge_root: Path,
+    branch_policy: str,
+) -> dict[str, object]:
+    """校验固定目录并原子写入仅供本机使用的配置。"""
+
+    resolved_input = resolve_directory(input_dir, "固定输入目录")
+    resolved_knowledge = resolve_directory(knowledge_root, "固定知识库根目录")
+    if resolved_input == resolved_knowledge:
+        raise RunError("固定输入目录和知识库根目录不得相同")
+    settings = {
+        "format": LOCAL_SETTINGS_FORMAT,
+        "input_dir": str(resolved_input),
+        "knowledge_root": str(resolved_knowledge),
+        "branch_policy": branch_policy,
+    }
+    atomic_write(settings_path, serialize_json(settings).encode("utf-8"))
+    return {
+        "status": "configured",
+        "settings_path": str(settings_path.resolve()),
+        **settings,
+    }
+
+
+def discover_inbox_paths(input_dir: Path) -> tuple[list[Path], list[dict[str, str]]]:
+    """把收件箱一级 JSON、ZIP 和子目录发现为独立投递单元。"""
+
+    units: list[Path] = []
+    ignored: list[dict[str, str]] = []
+    try:
+        entries = sorted(
+            input_dir.iterdir(), key=lambda path: (path.name.casefold(), path.name)
+        )
+    except OSError as exc:
+        raise RunError(f"无法扫描固定输入目录：{input_dir}") from exc
+    for entry in entries:
+        if knowledge_inventory.is_link_like(entry):
+            ignored.append({"name": entry.name, "reason": "link_like"})
+            continue
+        if entry.is_dir() or (
+            entry.is_file() and entry.suffix.casefold() in {".json", ".zip"}
+        ):
+            units.append(entry.resolve())
+        else:
+            ignored.append({"name": entry.name, "reason": "unsupported"})
+    return units, ignored
+
+
+def run_history_by_input(
+    knowledge_root: Path,
+) -> tuple[dict[str, list[dict[str, str]]], dict[str, str]]:
+    """读取输入集合状态及已应用的逐来源内容哈希。"""
+
+    history: dict[str, list[dict[str, str]]] = {}
+    applied_sources: dict[str, str] = {}
+    runs_root = knowledge_root.joinpath(*RUN_RELATIVE_ROOT.parts)
+    if not runs_root.exists():
+        return history, applied_sources
+    if knowledge_inventory.is_link_like(runs_root) or not runs_root.is_dir():
+        raise RunError(f"运行目录必须是普通目录：{runs_root}")
+    for run_root in sorted(
+        runs_root.iterdir(), key=lambda path: (path.name.casefold(), path.name)
+    ):
+        manifest = run_root / "run.json"
+        if (
+            knowledge_inventory.is_link_like(run_root)
+            or not run_root.is_dir()
+            or knowledge_inventory.is_link_like(manifest)
+            or not manifest.is_file()
+        ):
+            continue
+        try:
+            document = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(document, dict):
+            continue
+        input_value = document.get("input")
+        input_sha = input_value.get("sha256") if isinstance(input_value, dict) else None
+        status = document.get("status")
+        format_value = document.get("format")
+        if (
+            not isinstance(input_sha, str)
+            or not SHA256_PATTERN.fullmatch(input_sha)
+            or status not in {"initialized", "review_ready", "applied"}
+            or not isinstance(format_value, str)
+            or not format_value.startswith("conversation-knowledge-curator.run.v")
+        ):
+            continue
+        if format_value == FORMAT_VERSION:
+            try:
+                validate_run_document(document)
+            except RunError:
+                continue
+            bound_root = Path(str(document["knowledge_root"])).resolve(strict=False)
+            if bound_root != knowledge_root:
+                continue
+        history.setdefault(input_sha, []).append(
+            {
+                "status": str(status),
+                "format": format_value,
+                "run_directory": str(run_root.resolve()),
+            }
+        )
+        if status == "applied":
+            source_values = input_value.get("sources")
+            if isinstance(source_values, list):
+                for source_value in source_values:
+                    if not isinstance(source_value, dict):
+                        continue
+                    source_sha = source_value.get("sha256")
+                    if isinstance(source_sha, str) and SHA256_PATTERN.fullmatch(
+                        source_sha
+                    ):
+                        applied_sources.setdefault(source_sha, str(run_root.resolve()))
+    return history, applied_sources
+
+
+def choose_inbox_state(records: list[dict[str, str]]) -> dict[str, str] | None:
+    """按已应用、待审核、可恢复的优先级选择投递单元状态。"""
+
+    current = [record for record in records if record["format"] == FORMAT_VERSION]
+    for status in ("applied", "review_ready", "initialized"):
+        match = next((record for record in current if record["status"] == status), None)
+        if match is not None:
+            return match
+    return next(
+        (record for record in records if record["status"] == "applied"), None
+    )
+
+
+def inbox_unit_record(
+    path: Path,
+    branch_policy: str,
+    history: dict[str, list[dict[str, str]]],
+    applied_sources: dict[str, str],
+) -> dict[str, object]:
+    """检查一个投递单元并计算可重复使用的状态。"""
+
+    _, metadata = collect_visible_view(path, branch_policy)
+    input_sha = str(metadata["input_sha256"])
+    state = choose_inbox_state(history.get(input_sha, []))
+    source_hashes = [str(source["sha256"]) for source in metadata["sources"]]
+    if state is None and source_hashes and all(
+        source_sha in applied_sources for source_sha in source_hashes
+    ):
+        state = {
+            "status": "applied",
+            "format": "source-content-match",
+            "run_directory": applied_sources[source_hashes[0]],
+        }
+    record: dict[str, object] = {
+        "unit_ref": input_sha,
+        "name": path.name,
+        "path": str(path),
+        "input_type": metadata["input_type"],
+        "sha256": input_sha,
+        "conversation_count": metadata["conversation_count"],
+        "message_count": metadata["message_count"],
+    }
+    if state is None:
+        record["state"] = "pending"
+        record["suggested_run_id"] = f"inbox-{input_sha[:56]}"
+    else:
+        record["state"] = state["status"]
+        record["run_directory"] = state["run_directory"]
+    return record
+
+
+def inspect_inbox(settings_path: Path) -> dict[str, object]:
+    """扫描固定输入目录并区分待处理、可恢复和待审核单元。"""
+
+    settings = load_local_settings(settings_path)
+    input_dir = Path(str(settings["input_dir"]))
+    knowledge_root = Path(str(settings["knowledge_root"]))
+    units, ignored = discover_inbox_paths(input_dir)
+    history, applied_sources = run_history_by_input(knowledge_root)
+    pending: list[dict[str, object]] = []
+    resumable: list[dict[str, object]] = []
+    awaiting_review: list[dict[str, object]] = []
+    invalid: list[dict[str, str]] = []
+    processed_count = 0
+    for path in units:
+        try:
+            record = inbox_unit_record(
+                path,
+                str(settings["branch_policy"]),
+                history,
+                applied_sources,
+            )
+        except (RunError, chatgpt_export.ExportError, OSError) as exc:
+            invalid.append({"name": path.name, "path": str(path), "error": str(exc)})
+            continue
+        state = record.pop("state")
+        if state == "pending":
+            pending.append(record)
+        elif state == "initialized":
+            resumable.append(record)
+        elif state == "review_ready":
+            awaiting_review.append(record)
+        else:
+            processed_count += 1
+    return {
+        "format": INBOX_FORMAT,
+        "settings_path": str(settings_path.resolve()),
+        "input_dir": str(input_dir),
+        "knowledge_root": str(knowledge_root),
+        "summary": {
+            "pending": len(pending),
+            "resumable": len(resumable),
+            "awaiting_review": len(awaiting_review),
+            "processed": processed_count,
+            "invalid": len(invalid),
+            "ignored": len(ignored),
+        },
+        "pending": pending,
+        "resumable": resumable,
+        "awaiting_review": awaiting_review,
+        "invalid": invalid,
+        "ignored": ignored,
+    }
+
+
+def initialize_inbox_unit(settings_path: Path, unit_ref: str) -> dict[str, object]:
+    """按收件箱引用初始化一个新 Run，并对重复调用返回现有状态。"""
+
+    if not SHA256_PATTERN.fullmatch(unit_ref):
+        raise RunError("unit_ref 必须是 inbox 返回的 64 位小写 SHA-256")
+    settings = load_local_settings(settings_path)
+    input_dir = Path(str(settings["input_dir"]))
+    knowledge_root = Path(str(settings["knowledge_root"]))
+    units, _ = discover_inbox_paths(input_dir)
+    history, applied_sources = run_history_by_input(knowledge_root)
+    matches: list[tuple[Path, dict[str, object]]] = []
+    for path in units:
+        record = inbox_unit_record(
+            path,
+            str(settings["branch_policy"]),
+            history,
+            applied_sources,
+        )
+        if record["unit_ref"] == unit_ref:
+            matches.append((path, record))
+    if not matches:
+        raise RunError("收件箱中不存在该 unit_ref；请重新运行 inbox")
+    if len(matches) > 1:
+        raise RunError("多个投递单元具有相同 unit_ref，无法唯一选择")
+    path, record = matches[0]
+    state = record["state"]
+    if state != "pending":
+        public_status = {
+            "initialized": "resumable",
+            "review_ready": "awaiting_review",
+            "applied": "already_processed",
+        }[str(state)]
+        return {
+            "status": public_status,
+            "run_directory": record["run_directory"],
+            "unit_ref": unit_ref,
+        }
+    run_id = str(record["suggested_run_id"])
+    run_root, document = initialize_run(
+        knowledge_root,
+        path,
+        run_id,
+        str(settings["branch_policy"]),
+    )
+    parsing = document["parsing"]
+    assert isinstance(parsing, dict)
+    return {
+        "status": "initialized",
+        "unit_ref": unit_ref,
+        "run_directory": str(run_root),
+        "conversation_count": parsing["conversation_count"],
+        "message_count": parsing["message_count"],
+        "batch_count": len(parsing["batches"]),
+    }
 
 
 def inventory_snapshot(knowledge_root: Path) -> tuple[dict[str, object], str]:
@@ -754,23 +1093,55 @@ def available_source_index(
         if not conversation_ref or conversation_ref in index:
             raise RunError("可见对话 conversation_ref 缺失或重复")
         messages = conversation.get("messages", [])
+        message_index: dict[str, dict[str, object]] = {}
+        if not isinstance(messages, list):
+            raise RunError("可见对话 messages 必须是数组")
+        for position, message in enumerate(messages):
+            if not isinstance(message, dict):
+                raise RunError("可见消息必须是对象")
+            message_id = message.get("message_id")
+            role = message.get("role")
+            text = message.get("text")
+            if (
+                not isinstance(message_id, str)
+                or not message_id
+                or message_id in message_index
+                or role not in {"user", "assistant"}
+                or not isinstance(text, str)
+            ):
+                raise RunError("可见消息 ID、角色或正文无效")
+            message_index[message_id] = {
+                "role": role,
+                "position": position,
+                "text": text,
+            }
         index[conversation_ref] = {
             "source_sha256": str(conversation["source_sha256"]),
             "conversation_id": str(conversation["conversation_id"]),
-            "message_ids": {
-                str(message["message_id"])
-                for message in messages
-                if isinstance(message, dict) and "message_id" in message
-            },
+            "title": str(conversation.get("title", "")),
+            "messages": message_index,
         }
     return index
+
+
+def message_preview(text: str) -> str:
+    """压缩消息正文并返回有界审核预览，不写入 run.json。"""
+
+    compact = " ".join(text.split())
+    if len(compact) <= MESSAGE_PREVIEW_CHARS:
+        return compact
+    return compact[: MESSAGE_PREVIEW_CHARS - 1] + "…"
 
 
 def parse_review_input(
     raw_text: str,
     proposed_targets: set[str],
     conversations: list[dict[str, object]],
-) -> tuple[dict[str, list[dict[str, object]]], list[dict[str, object]]]:
+) -> tuple[
+    dict[str, dict[str, object]],
+    dict[str, list[dict[str, object]]],
+    list[dict[str, object]],
+]:
     """严格校验标准输入中的文档级来源和风险元数据。"""
 
     raw_text = raw_text.removeprefix("\ufeff")
@@ -789,24 +1160,36 @@ def parse_review_input(
         raise RunError("审核元数据 outputs 和 issues 必须是数组")
 
     available = available_source_index(conversations)
-    source_map: dict[str, list[dict[str, object]]] = {}
+    output_metadata: dict[str, dict[str, object]] = {}
+    source_contexts: dict[str, list[dict[str, object]]] = {}
+    assistant_only_targets: set[str] = set()
     for output_index, output in enumerate(value["outputs"]):
         context = f"审核元数据 outputs[{output_index}]"
         if not isinstance(output, dict):
             raise RunError(f"{context} 必须是对象")
-        require_exact_fields(output, {"target_path", "sources"}, f"{context} ")
+        require_exact_fields(
+            output,
+            {
+                "target_path",
+                "sources",
+                "evidence_kinds",
+                "official_references",
+            },
+            f"{context} ",
+        )
         target_path = output["target_path"]
         if not isinstance(target_path, str):
             raise RunError(f"{context}.target_path 必须是字符串")
         safe_target_path(target_path)
         if target_path not in proposed_targets:
             raise RunError(f"审核元数据引用未知 proposed 目标：{target_path}")
-        if target_path in source_map:
+        if target_path in output_metadata:
             raise RunError(f"审核元数据重复登记目标：{target_path}")
         sources = output["sources"]
         if not isinstance(sources, list) or not sources:
             raise RunError(f"{context}.sources 必须是非空数组")
         normalized_sources: list[dict[str, object]] = []
+        normalized_contexts: list[dict[str, object]] = []
         seen_sources: set[str] = set()
         for source_index, source in enumerate(sources):
             source_context = f"{context}.sources[{source_index}]"
@@ -837,13 +1220,33 @@ def parse_review_input(
             if len(set(message_ids)) != len(message_ids):
                 raise RunError(f"{source_context}.message_ids 不得重复")
             available_source = available[conversation_ref]
-            available_messages = available_source["message_ids"]
-            assert isinstance(available_messages, set)
-            unknown_messages = sorted(set(message_ids) - available_messages)
+            available_messages = available_source["messages"]
+            assert isinstance(available_messages, dict)
+            unknown_messages = sorted(set(message_ids) - set(available_messages))
             if unknown_messages:
                 raise RunError(
                     f"{source_context} 引用了未知可见消息：{unknown_messages}"
                 )
+            selected_messages = [available_messages[item] for item in message_ids]
+            positions = [int(item["position"]) for item in selected_messages]
+            if positions != sorted(positions):
+                raise RunError(
+                    f"{source_context}.message_ids 必须遵循原对话顺序"
+                )
+            selected_users = {
+                int(item["position"])
+                for item in selected_messages
+                if item["role"] == "user"
+            }
+            if any(
+                item["role"] == "assistant"
+                and not any(
+                    user_position < int(item["position"])
+                    for user_position in selected_users
+                )
+                for item in selected_messages
+            ):
+                assistant_only_targets.add(target_path)
             seen_sources.add(conversation_ref)
             normalized_sources.append(
                 {
@@ -852,8 +1255,89 @@ def parse_review_input(
                     "message_ids": list(message_ids),
                 }
             )
-        source_map[target_path] = normalized_sources
-    missing_targets = sorted(proposed_targets - set(source_map))
+            normalized_contexts.append(
+                {
+                    "conversation_ref": conversation_ref,
+                    "title": available_source["title"],
+                    "messages": [
+                        {
+                            "message_id": message_id,
+                            "role": selected["role"],
+                            "preview": message_preview(str(selected["text"])),
+                        }
+                        for message_id, selected in zip(
+                            message_ids,
+                            selected_messages,
+                            strict=True,
+                        )
+                    ],
+                }
+            )
+
+        evidence_kinds = output["evidence_kinds"]
+        if (
+            not isinstance(evidence_kinds, list)
+            or not evidence_kinds
+            or not all(isinstance(kind, str) for kind in evidence_kinds)
+            or not all(kind in EVIDENCE_KINDS for kind in evidence_kinds)
+            or len(set(evidence_kinds)) != len(evidence_kinds)
+            or "conversation_statement" not in evidence_kinds
+        ):
+            raise RunError(
+                f"{context}.evidence_kinds 必须是不重复的有效数组，"
+                "且包含 conversation_statement"
+            )
+        official_references = output["official_references"]
+        if not isinstance(official_references, list):
+            raise RunError(f"{context}.official_references 必须是数组")
+        normalized_references: list[dict[str, str]] = []
+        seen_urls: set[str] = set()
+        for reference_index, reference in enumerate(official_references):
+            reference_context = (
+                f"{context}.official_references[{reference_index}]"
+            )
+            if not isinstance(reference, dict):
+                raise RunError(f"{reference_context} 必须是对象")
+            require_exact_fields(
+                reference,
+                {"title", "url", "supports"},
+                f"{reference_context} ",
+            )
+            title = reference["title"]
+            url = reference["url"]
+            supports = reference["supports"]
+            if (
+                not isinstance(title, str)
+                or not title.strip()
+                or not isinstance(url, str)
+                or not re.fullmatch(r"https?://[^\s]+", url)
+                or not isinstance(supports, str)
+                or not supports.strip()
+            ):
+                raise RunError(f"{reference_context} 字段类型或取值无效")
+            if url in seen_urls:
+                raise RunError(f"{reference_context}.url 不得重复")
+            seen_urls.add(url)
+            normalized_references.append(
+                {
+                    "title": title.strip(),
+                    "url": url,
+                    "supports": supports.strip(),
+                }
+            )
+        has_official_evidence = "official_verification" in evidence_kinds
+        if has_official_evidence != bool(normalized_references):
+            raise RunError(
+                f"{context} 的 official_verification 与 official_references "
+                "必须同时存在或同时缺省"
+            )
+        output_metadata[target_path] = {
+            "sources": normalized_sources,
+            "evidence_kinds": list(evidence_kinds),
+            "official_references": normalized_references,
+        }
+        source_contexts[target_path] = normalized_contexts
+    missing_targets = sorted(proposed_targets - set(output_metadata))
     if missing_targets:
         raise RunError(f"审核元数据未覆盖 proposed 目标：{missing_targets}")
 
@@ -878,7 +1362,21 @@ def parse_review_input(
         normalized_issues.append(
             {"kind": kind, "message": message, "target_path": target_path}
         )
-    return source_map, normalized_issues
+    declared_assistant_only = {
+        str(issue["target_path"])
+        for issue in normalized_issues
+        if issue["kind"] == "assistant_only" and issue["target_path"] is not None
+    }
+    missing_assistant_only = sorted(
+        assistant_only_targets - declared_assistant_only
+    )
+    if missing_assistant_only:
+        raise RunError(
+            "以下目标引用了缺少前置 user 上下文的 assistant 消息，"
+            "必须补充来源链或登记 assistant_only 风险："
+            f"{missing_assistant_only}"
+        )
+    return output_metadata, source_contexts, normalized_issues
 
 
 def read_standard_input() -> str:
@@ -959,6 +1457,7 @@ def initialize_run(
         },
         "outputs": [],
         "issues": [],
+        "review": None,
         "approval": None,
         "apply": {"status": "not_applied", "entries": []},
     }
@@ -977,7 +1476,7 @@ def initialize_run(
 
 
 def validate_run_document(document: object) -> dict[str, object]:
-    """严格校验 run.v6 顶层和关键子结构。"""
+    """严格校验 run.v8 顶层和关键子结构。"""
 
     if not isinstance(document, dict):
         raise RunError("run.json 顶层必须是对象")
@@ -985,12 +1484,13 @@ def validate_run_document(document: object) -> dict[str, object]:
         document,
         {
             "format", "run_id", "status", "knowledge_root", "input",
-            "parsing", "knowledge_base", "outputs", "issues", "approval", "apply",
+            "parsing", "knowledge_base", "outputs", "issues", "review",
+            "approval", "apply",
         },
         "run.json ",
     )
     if document["format"] != FORMAT_VERSION:
-        raise RunError("仅支持 conversation-knowledge-curator.run.v6")
+        raise RunError("仅支持 conversation-knowledge-curator.run.v8")
     validate_run_id(document["run_id"])
     if (
         not isinstance(document["status"], str)
@@ -1277,7 +1777,8 @@ def validate_run_document(document: object) -> dict[str, object]:
             output,
             {
                 "target_path", "proposed_path", "base_sha256",
-                "proposed_sha256", "sources",
+                "proposed_sha256", "sources", "evidence_kinds",
+                "official_references",
             },
             f"run.json.outputs[{index}] ",
         )
@@ -1288,6 +1789,19 @@ def validate_run_document(document: object) -> dict[str, object]:
             )
         ) or not isinstance(output["sources"], list):
             raise RunError(f"run.json.outputs[{index}] 字段类型无效")
+        if (
+            not isinstance(output["evidence_kinds"], list)
+            or not output["evidence_kinds"]
+            or not all(
+                isinstance(kind, str) for kind in output["evidence_kinds"]
+            )
+            or not all(kind in EVIDENCE_KINDS for kind in output["evidence_kinds"])
+            or len(set(output["evidence_kinds"]))
+            != len(output["evidence_kinds"])
+            or "conversation_statement" not in output["evidence_kinds"]
+            or not isinstance(output["official_references"], list)
+        ):
+            raise RunError(f"run.json.outputs[{index}] 证据字段无效")
         for source_index, source_ref in enumerate(output["sources"]):
             context = f"run.json.outputs[{index}].sources[{source_index}]"
             if not isinstance(source_ref, dict):
@@ -1310,6 +1824,31 @@ def validate_run_document(document: object) -> dict[str, object]:
                 )
             ):
                 raise RunError(f"{context} 字段类型或取值无效")
+        for reference_index, reference in enumerate(output["official_references"]):
+            context = (
+                f"run.json.outputs[{index}].official_references"
+                f"[{reference_index}]"
+            )
+            if not isinstance(reference, dict):
+                raise RunError(f"{context} 必须是对象")
+            require_exact_fields(
+                reference, {"title", "url", "supports"}, f"{context} "
+            )
+            if (
+                not all(
+                    isinstance(reference[name], str) and reference[name].strip()
+                    for name in ("title", "url", "supports")
+                )
+                or not re.fullmatch(r"https?://[^\s]+", str(reference["url"]))
+            ):
+                raise RunError(f"{context} 字段类型或取值无效")
+        if (
+            ("official_verification" in output["evidence_kinds"])
+            != bool(output["official_references"])
+        ):
+            raise RunError(
+                f"run.json.outputs[{index}] 官方核验证据与引用不一致"
+            )
     for index, issue in enumerate(document["issues"]):
         context = f"run.json.issues[{index}]"
         if not isinstance(issue, dict):
@@ -1327,6 +1866,62 @@ def validate_run_document(document: object) -> dict[str, object]:
             )
         ):
             raise RunError(f"{context} 字段类型或取值无效")
+    review = document["review"]
+    if review is not None:
+        if not isinstance(review, dict):
+            raise RunError("run.json.review 必须是对象或 null")
+        require_exact_fields(review, {"entries"}, "run.json.review ")
+        if not isinstance(review["entries"], list):
+            raise RunError("run.json.review 字段类型或取值无效")
+        review_targets: set[str] = set()
+        for index, entry in enumerate(review["entries"]):
+            context = f"run.json.review.entries[{index}]"
+            if not isinstance(entry, dict):
+                raise RunError(f"{context} 必须是对象")
+            require_exact_fields(
+                entry,
+                {
+                    "target_path",
+                    "base_sha256",
+                    "proposed_sha256",
+                    "diff_sha256",
+                },
+                f"{context} ",
+            )
+            if (
+                not isinstance(entry["target_path"], str)
+                or not entry["target_path"]
+                or entry["target_path"] in review_targets
+                or not all(
+                    isinstance(entry[name], str)
+                    and SHA256_PATTERN.fullmatch(entry[name])
+                    for name in (
+                        "base_sha256",
+                        "proposed_sha256",
+                        "diff_sha256",
+                    )
+                )
+            ):
+                raise RunError(f"{context} 字段类型或取值无效")
+            review_targets.add(str(entry["target_path"]))
+        output_bindings = {
+            (
+                str(output["target_path"]),
+                str(output["base_sha256"]),
+                str(output["proposed_sha256"]),
+            )
+            for output in document["outputs"]
+        }
+        review_bindings = {
+            (
+                str(entry["target_path"]),
+                str(entry["base_sha256"]),
+                str(entry["proposed_sha256"]),
+            )
+            for entry in review["entries"]
+        }
+        if review_bindings != output_bindings:
+            raise RunError("run.json.review 与 outputs 审核绑定不一致")
     approval = document["approval"]
     if approval is not None:
         if not isinstance(approval, dict):
@@ -1346,7 +1941,7 @@ def validate_run_document(document: object) -> dict[str, object]:
 
 
 def load_run(run_directory: Path) -> tuple[Path, Path, dict[str, object]]:
-    """读取 v2 run，并校验其固定位置与根目录绑定。"""
+    """读取当前 run，并校验其固定位置与根目录绑定。"""
 
     run_root = resolve_directory(run_directory, "run 目录")
     manifest = run_root / "run.json"
@@ -1644,8 +2239,9 @@ def prepare_review(
     document: dict[str, object],
     review_input_text: str,
     full_diff: bool,
+    target_paths: list[str] | None,
 ) -> dict[str, object]:
-    """校验 proposed 与来源元数据，并按场景返回审核材料。"""
+    """校验全部 proposed，并按需返回简报或指定目标的完整详情。"""
 
     if document["status"] == "applied":
         raise RunError("已应用的 run 不能重新准备审核")
@@ -1653,13 +2249,27 @@ def prepare_review(
     _, metadata = current_view(source, document)
     proposed_documents = discover_proposed(run_root)
     proposed_targets = {target_path for target_path, _ in proposed_documents}
-    source_map, issues = parse_review_input(
+    requested_targets = target_paths or []
+    if requested_targets and not full_diff:
+        raise RunError("--target 只能与 --full-diff 一起使用")
+    if len(set(requested_targets)) != len(requested_targets):
+        raise RunError("--target 不得重复")
+    for target_path in requested_targets:
+        safe_target_path(target_path)
+    unknown_targets = sorted(set(requested_targets) - proposed_targets)
+    if unknown_targets:
+        raise RunError(f"--target 引用了未知 proposed 目标：{unknown_targets}")
+    detailed_targets = (
+        set(requested_targets) if requested_targets else proposed_targets
+    ) if full_diff else set()
+    output_metadata, source_contexts, issues = parse_review_input(
         review_input_text,
         proposed_targets,
         metadata["conversations"],
     )
     outputs: list[dict[str, object]] = []
     review_items: list[dict[str, object]] = []
+    review_entries: list[dict[str, str]] = []
     for target_path, proposed_path in proposed_documents:
         target = resolve_target(knowledge_root, target_path)
         proposed = proposed_path.read_bytes()
@@ -1676,46 +2286,127 @@ def prepare_review(
             raise RunError(f"文档质量检查失败：{target_path}：{quality['issues']}")
         if proposed == before:
             raise RunError(f"proposed 与现有文档相同：{target_path}")
+        target_metadata = output_metadata[target_path]
+        official_references = target_metadata["official_references"]
+        assert isinstance(official_references, list)
+        missing_reference_urls = [
+            str(reference["url"])
+            for reference in official_references
+            if str(reference["url"]) not in text
+        ]
+        if missing_reference_urls:
+            raise RunError(
+                f"proposed 未保留登记的官方资料链接：{target_path}："
+                f"{missing_reference_urls}"
+            )
+        diff_text = unified_diff(before, proposed, target_path)
         output = {
             "target_path": target_path,
             "proposed_path": f"{PROPOSED_DIRECTORY}/{target_path}",
             "base_sha256": sha256_bytes(before),
             "proposed_sha256": sha256_bytes(proposed),
-            "sources": source_map[target_path],
+            "sources": target_metadata["sources"],
+            "evidence_kinds": target_metadata["evidence_kinds"],
+            "official_references": official_references,
         }
         outputs.append(output)
-        include_diff = full_diff
-        review_item: dict[str, object] = {
-            "target_path": target_path,
-            "proposed_path": output["proposed_path"],
-            "change": "update" if target.exists() else "create",
-            "base_sha256": output["base_sha256"],
-            "proposed_sha256": output["proposed_sha256"],
-            "sources": source_map[target_path],
-            "outline": document_outline(text),
-            "diff_included": include_diff,
-        }
-        if target.exists():
-            review_item["diff_summary"] = diff_summary(
-                before,
-                proposed,
-                target_path,
+        outline = document_outline(text)
+        change_summary = (
+            diff_summary(before, proposed, target_path)
+            if target.exists()
+            else {
+                "added_line_count": outline["line_count"],
+                "removed_line_count": 0,
+                "added_headings": outline["headings"],
+                "removed_headings": [],
+                "changed_sections": [],
+            }
+        )
+        if target_path in detailed_targets:
+            review_items.append(
+                {
+                    "target_path": target_path,
+                    "proposed_path": output["proposed_path"],
+                    "change": "update" if target.exists() else "create",
+                    "base_sha256": output["base_sha256"],
+                    "proposed_sha256": output["proposed_sha256"],
+                    "sources": output["sources"],
+                    "source_contexts": source_contexts[target_path],
+                    "evidence_kinds": output["evidence_kinds"],
+                    "official_references": official_references,
+                    "outline": outline,
+                    "diff_summary": change_summary,
+                    "diff_included": True,
+                    "diff": diff_text,
+                }
             )
-        if include_diff:
-            review_item["diff"] = unified_diff(before, proposed, target_path)
-        review_items.append(review_item)
+        elif not full_diff:
+            target_issues = [
+                issue
+                for issue in issues
+                if issue["target_path"] in {None, target_path}
+            ]
+            sources = output["sources"]
+            assert isinstance(sources, list)
+            review_items.append(
+                {
+                    "target_path": target_path,
+                    "change": "update" if target.exists() else "create",
+                    "title": outline["title"],
+                    "line_count": outline["line_count"],
+                    "added_line_count": change_summary["added_line_count"],
+                    "removed_line_count": change_summary["removed_line_count"],
+                    "added_heading_count": len(change_summary["added_headings"]),
+                    "removed_heading_count": len(
+                        change_summary["removed_headings"]
+                    ),
+                    "changed_section_count": len(
+                        change_summary["changed_sections"]
+                    ),
+                    "source_conversation_count": len(sources),
+                    "source_message_count": sum(
+                        len(source["message_ids"]) for source in sources
+                    ),
+                    "evidence_kinds": output["evidence_kinds"],
+                    "official_reference_count": len(official_references),
+                    "issue_count": len(target_issues),
+                }
+            )
+        review_entries.append(
+            {
+                "target_path": target_path,
+                "base_sha256": str(output["base_sha256"]),
+                "proposed_sha256": str(output["proposed_sha256"]),
+                "diff_sha256": sha256_bytes(diff_text.encode("utf-8")),
+            }
+        )
     document["outputs"] = outputs
     document["issues"] = issues
+    document["review"] = {"entries": review_entries}
     document["approval"] = None
     document["apply"] = {"status": "not_applied", "entries": []}
     document["status"] = "review_ready"
     save_run(run_root, document)
+    returned_issues = (
+        [
+            issue
+            for issue in issues
+            if issue["target_path"] is None
+            or issue["target_path"] in detailed_targets
+        ]
+        if full_diff and requested_targets
+        else issues
+    )
     return {
         "format": REVIEW_FORMAT,
         "status": "review_ready",
+        "presentation": "full_diff" if full_diff else "summary",
+        "apply_ready": True,
         "run_id": document["run_id"],
+        "output_count": len(outputs),
+        "returned_output_count": len(review_items),
         "outputs": review_items,
-        "issues": document["issues"],
+        "issues": returned_issues,
     }
 
 
@@ -1837,6 +2528,9 @@ def apply_outputs(
 
     if document["status"] != "review_ready":
         raise RunError("run 尚未准备好审核，不能应用")
+    review = document.get("review")
+    if not isinstance(review, dict):
+        raise RunError("apply 前必须先准备当前 proposed 的审核简报")
     ensure_snapshot(knowledge_root, document)
     outputs = document["outputs"]
     assert isinstance(outputs, list)
@@ -1944,8 +2638,19 @@ def recover_apply(
 
 
 def execute_command(args: argparse.Namespace) -> tuple[dict[str, object], int]:
-    """执行一个 run.v6 命令并返回结构化结果。"""
+    """执行一个 run.v8 命令并返回结构化结果。"""
 
+    if args.command == "configure-inbox":
+        return configure_inbox(
+            args.settings,
+            args.input_dir,
+            args.knowledge_root,
+            args.branch,
+        ), 0
+    if args.command == "inbox":
+        return inspect_inbox(args.settings), 0
+    if args.command == "init-inbox":
+        return initialize_inbox_unit(args.settings, args.unit_ref), 0
     if args.command == "init":
         run_root, document = initialize_run(
             args.knowledge_root, args.input_path, args.run_id, args.branch
@@ -1980,6 +2685,7 @@ def execute_command(args: argparse.Namespace) -> tuple[dict[str, object], int]:
             document,
             read_standard_input(),
             args.full_diff,
+            args.target,
         ), 0
     if args.command == "apply":
         return apply_outputs(root, run_root, document, args.approve), 0
@@ -1992,9 +2698,34 @@ def create_parser() -> argparse.ArgumentParser:
     """创建唯一公开运行 CLI。"""
 
     parser = argparse.ArgumentParser(
-        description="以单一 run.v6 流程整理 ChatGPT 对话知识。"
+        description="以单一 run.v8 流程整理 ChatGPT 对话知识。"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+    configure_parser = subparsers.add_parser(
+        "configure-inbox", help="保存本机固定输入目录和知识库目录"
+    )
+    configure_parser.add_argument("input_dir", type=Path)
+    configure_parser.add_argument("knowledge_root", type=Path)
+    configure_parser.add_argument(
+        "--branch", choices=("active", "all"), default="active"
+    )
+    configure_parser.add_argument(
+        "--settings", type=Path, default=DEFAULT_SETTINGS_PATH, help=argparse.SUPPRESS
+    )
+
+    inbox_parser = subparsers.add_parser("inbox", help="扫描未处理的投递单元")
+    inbox_parser.add_argument(
+        "--settings", type=Path, default=DEFAULT_SETTINGS_PATH, help=argparse.SUPPRESS
+    )
+
+    inbox_init_parser = subparsers.add_parser(
+        "init-inbox", help="按 inbox 返回的引用创建或恢复 run"
+    )
+    inbox_init_parser.add_argument("unit_ref")
+    inbox_init_parser.add_argument(
+        "--settings", type=Path, default=DEFAULT_SETTINGS_PATH, help=argparse.SUPPRESS
+    )
+
     init_parser = subparsers.add_parser("init", help="检查输入并创建 run")
     init_parser.add_argument("knowledge_root", type=Path)
     init_parser.add_argument("input_path", type=Path)
@@ -2017,7 +2748,12 @@ def create_parser() -> argparse.ArgumentParser:
     review_parser.add_argument(
         "--full-diff",
         action="store_true",
-        help="同时返回新建文档的完整 diff",
+        help="返回完整 diff；可用 --target 只展开指定目标",
+    )
+    review_parser.add_argument(
+        "--target",
+        action="append",
+        help="只展开指定目标的完整详情；可重复使用，且要求 --full-diff",
     )
 
     apply_parser = subparsers.add_parser("apply", help="应用明确批准的全部目标")

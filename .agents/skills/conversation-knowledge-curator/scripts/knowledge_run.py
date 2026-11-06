@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""conversation-knowledge-curator.run.v6 的唯一公开命令入口。"""
+"""conversation-knowledge-curator.run.v8 的唯一公开命令入口。"""
 
 from __future__ import annotations
 

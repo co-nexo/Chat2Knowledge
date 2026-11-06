@@ -10,7 +10,7 @@
 
 1. run manifest 必须使用当前格式和固定字段，未知字段会被拒绝。
 2. 移动 run 或篡改知识库根目录会被拒绝。
-3. 唯一公开 CLI 使用 run.v6，不再暴露 inspect 与 normalize 阶段。
+3. 唯一公开 CLI 使用 run.v8，不再暴露 inspect 与 normalize 阶段。
 4. 旧 Candidate、Proposal、Review 和 Apply 编排脚本不再存在。
 
 已覆盖的 CLI 行为：
@@ -113,7 +113,7 @@ class RunInitializationTests(unittest.TestCase):
             )
             self.assertEqual(
                 document["format"],
-                "conversation-knowledge-curator.run.v6",
+                "conversation-knowledge-curator.run.v8",
             )
             self.assertTrue((run_root / "run.json").is_file())
             self.assertTrue((run_root / "proposed").is_dir())

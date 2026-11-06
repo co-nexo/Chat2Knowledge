@@ -3,7 +3,7 @@
 已覆盖的初始化与读取行为：
 
 1. 初始化只创建 run.json 和 proposed，不持久化 normalized、候选或检索结果。
-2. run.json 使用 v6，保存逐来源清单、无正文分片和知识库快照，不复制对话正文。
+2. run.json 使用 v8，保存逐来源清单、无正文分片和知识库快照，不复制对话正文。
 3. read-input 每次从原始 JSON 动态重建可见消息，并拒绝变化后的输入。
 4. 空知识库的 context 明确跳过检索。
 5. 非空知识库的 context 返回有限相关原文，但不保存 inventory 或 retrieval 文件。
@@ -13,15 +13,21 @@
 9. 批次引用的重复、缺失或乱序分片会被 run 契约校验拒绝。
 10. 重复内容来源保留审计记录但只处理一次，来源清单篡改会被拒绝。
 11. 小输入一次返回，较大输入按规模选择预算；可见输出不重复暴露路径和 Hash。
+12. 本地配置固定输入与输出目录，收件箱按一级投递单元发现 JSON、ZIP 和目录。
+13. 收件箱按输入哈希区分待处理、可恢复、待审核和已处理，内容变化后重新待处理。
+14. 无效或不支持的投递单元不会创建正式 Run，并以精简诊断返回。
+15. 已应用组合 Run 中的单个来源再次出现时，不会被拆开重复处理。
 
 已覆盖的审核与应用行为：
 
-1. prepare-review 校验来源元数据；默认返回轻量审核信息，完整 diff 可按需请求。
+1. prepare-review 校验全部来源和 diff；默认简报可批准，指定目标才展开完整详情。
 2. 审核绑定目标、基线和 proposed 哈希；内容变化后旧批准失效。
 3. apply 必须明确批准全部目标，且不会执行任何 Git 操作。
 4. 知识库基线变化会在任何写入前停止，多文件中断可由 recover 恢复。
 5. recover 遇到中断后外部修改时拒绝覆盖，并保留恢复状态。
-6. 每个输出精确登记真实 message ID；缺失或伪造来源时不更新 run。
+6. 每个输出精确登记真实 message ID；assistant-only 来源必须登记风险。
+7. 详细审核临时返回角色与正文短预览，但简报和 run.json 不保存消息正文。
+8. 官方核验资料必须登记并保留在 proposed Markdown 中。
 """
 
 from __future__ import annotations
@@ -91,9 +97,14 @@ def review_metadata(
     }
     return json.dumps(
         {
-            "format": "conversation-knowledge-curator.review-input.v2",
+            "format": "conversation-knowledge-curator.review-input.v3",
             "outputs": [
-                {"target_path": path, "sources": [source_ref]}
+                {
+                    "target_path": path,
+                    "sources": [source_ref],
+                    "evidence_kinds": ["conversation_statement"],
+                    "official_references": [],
+                }
                 for path in target_paths
             ],
             "issues": issues or [],
@@ -127,7 +138,7 @@ class RuntimeTests(unittest.TestCase):
             knowledge_root, input_path = create_inputs(root)
 
             code, result, stderr = self.run_cli(
-                ["init", str(knowledge_root), str(input_path), "runtime-v6"]
+                ["init", str(knowledge_root), str(input_path), "runtime-v8"]
             )
 
             self.assertEqual(code, 0, stderr)
@@ -137,7 +148,7 @@ class RuntimeTests(unittest.TestCase):
                 ["proposed", "run.json"],
             )
             run = json.loads((run_root / "run.json").read_text(encoding="utf-8"))
-            self.assertEqual(run["format"], "conversation-knowledge-curator.run.v6")
+            self.assertEqual(run["format"], "conversation-knowledge-curator.run.v8")
             self.assertNotIn("conversations", run["parsing"])
             self.assertTrue(run["knowledge_base"]["empty"])
             self.assertEqual(len(run["input"]["sources"]), 1)
@@ -172,6 +183,148 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(changed_code, 2)
             self.assertEqual(changed, {})
             self.assertIn("变化", changed_stderr)
+
+    def test_inbox_configuration_discovers_units_and_reuses_run(self) -> None:
+        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
+            root = Path(directory)
+            input_dir = root / "input"
+            knowledge_root = root / "knowledge"
+            grouped = input_dir / "同批来源"
+            grouped.mkdir(parents=True)
+            knowledge_root.mkdir()
+            shutil.copyfile(FIXTURE, input_dir / "single.json")
+            shutil.copyfile(FIXTURE, grouped / "grouped.json")
+            (input_dir / "说明.txt").write_text("忽略", encoding="utf-8")
+            settings = root / "local-settings.json"
+
+            configure_code, configured, configure_stderr = self.run_cli(
+                [
+                    "configure-inbox",
+                    str(input_dir),
+                    str(knowledge_root),
+                    "--settings",
+                    str(settings),
+                ]
+            )
+            self.assertEqual(configure_code, 0, configure_stderr)
+            self.assertEqual(
+                configured["format"],
+                "conversation-knowledge-curator.local-settings.v1",
+            )
+
+            inbox_code, inbox, inbox_stderr = self.run_cli(
+                ["inbox", "--settings", str(settings)]
+            )
+            self.assertEqual(inbox_code, 0, inbox_stderr)
+            self.assertEqual(
+                inbox["format"], "conversation-knowledge-curator.inbox.v1"
+            )
+            self.assertEqual(inbox["summary"]["pending"], 2)
+            self.assertEqual(inbox["summary"]["ignored"], 1)
+            self.assertEqual(
+                {item["name"] for item in inbox["pending"]},
+                {"single.json", "同批来源"},
+            )
+
+            unit_ref = next(
+                item["unit_ref"]
+                for item in inbox["pending"]
+                if item["name"] == "single.json"
+            )
+            init_code, initialized, init_stderr = self.run_cli(
+                ["init-inbox", unit_ref, "--settings", str(settings)]
+            )
+            self.assertEqual(init_code, 0, init_stderr)
+            self.assertEqual(initialized["status"], "initialized")
+            self.assertTrue(Path(initialized["run_directory"]).is_dir())
+
+            repeat_code, repeated, repeat_stderr = self.run_cli(
+                ["init-inbox", unit_ref, "--settings", str(settings)]
+            )
+            self.assertEqual(repeat_code, 0, repeat_stderr)
+            self.assertEqual(repeated["status"], "resumable")
+
+            rescanned_code, rescanned, rescanned_stderr = self.run_cli(
+                ["inbox", "--settings", str(settings)]
+            )
+            self.assertEqual(rescanned_code, 0, rescanned_stderr)
+            self.assertEqual(rescanned["summary"]["pending"], 1)
+            self.assertEqual(rescanned["summary"]["resumable"], 1)
+
+    def test_inbox_content_change_becomes_new_pending_unit(self) -> None:
+        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
+            root = Path(directory)
+            input_dir = root / "input"
+            knowledge_root = root / "knowledge"
+            input_dir.mkdir()
+            knowledge_root.mkdir()
+            source = input_dir / "export.json"
+            shutil.copyfile(FIXTURE, source)
+            settings = root / "local-settings.json"
+            runtime.configure_inbox(settings, input_dir, knowledge_root, "active")
+            first = runtime.inspect_inbox(settings)
+            first_ref = first["pending"][0]["unit_ref"]
+            runtime.initialize_inbox_unit(settings, first_ref)
+
+            export = json.loads(source.read_text(encoding="utf-8"))
+            export[0]["title"] = "内容已更新"
+            source.write_text(
+                json.dumps(export, ensure_ascii=False), encoding="utf-8"
+            )
+            changed = runtime.inspect_inbox(settings)
+
+            self.assertEqual(changed["summary"]["pending"], 1)
+            self.assertEqual(changed["summary"]["resumable"], 0)
+            self.assertNotEqual(changed["pending"][0]["unit_ref"], first_ref)
+
+    def test_inbox_reports_invalid_unit_without_creating_run(self) -> None:
+        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
+            root = Path(directory)
+            input_dir = root / "input"
+            knowledge_root = root / "knowledge"
+            input_dir.mkdir()
+            knowledge_root.mkdir()
+            (input_dir / "broken.json").write_text("not json", encoding="utf-8")
+            settings = root / "local-settings.json"
+            runtime.configure_inbox(settings, input_dir, knowledge_root, "active")
+
+            report = runtime.inspect_inbox(settings)
+
+            self.assertEqual(report["summary"]["invalid"], 1)
+            self.assertEqual(report["summary"]["pending"], 0)
+            self.assertFalse((knowledge_root / ".knowledge-curator").exists())
+
+    def test_inbox_recognizes_sources_from_applied_group(self) -> None:
+        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
+            root = Path(directory)
+            input_dir = root / "input"
+            knowledge_root = root / "knowledge"
+            input_dir.mkdir()
+            knowledge_root.mkdir()
+            shutil.copyfile(FIXTURE, input_dir / "one.json")
+            second = json.loads(FIXTURE.read_text(encoding="utf-8"))
+            second[0]["title"] = "第二份来源"
+            (input_dir / "two.json").write_text(
+                json.dumps(second, ensure_ascii=False), encoding="utf-8"
+            )
+            run_root, _ = runtime.initialize_run(
+                knowledge_root, input_dir, "legacy-applied-group"
+            )
+            manifest_path = run_root / "run.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["format"] = "conversation-knowledge-curator.run.v7"
+            manifest["status"] = "applied"
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            settings = root / "local-settings.json"
+            runtime.configure_inbox(settings, input_dir, knowledge_root, "active")
+
+            report = runtime.inspect_inbox(settings)
+
+            self.assertEqual(report["summary"]["pending"], 0)
+            self.assertEqual(report["summary"]["processed"], 2)
 
     def test_init_unifies_multi_source_zip_and_directory_in_one_run(self) -> None:
         with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
@@ -709,7 +862,14 @@ class RuntimeTests(unittest.TestCase):
             proposed = run_root / "proposed" / "topics" / "example.md"
             proposed.parent.mkdir()
             proposed.write_text(
-                "# 示例知识\n\n## 1. 结论\n\n这是整理后的结论。\n",
+                (
+                    "# 示例知识\n\n## 1. 结论\n\n"
+                    + "\n\n".join(
+                        f"这是整理后的第 {index} 条结论。"
+                        for index in range(1, 41)
+                    )
+                    + "\n"
+                ),
                 encoding="utf-8",
                 newline="\n",
             )
@@ -732,24 +892,57 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(review_code, 0, review_stderr)
             self.assertEqual(
                 review["format"],
-                "conversation-knowledge-curator.review.v3",
+                "conversation-knowledge-curator.review.v5",
             )
-            self.assertFalse(review["outputs"][0]["diff_included"])
+            self.assertEqual(review["presentation"], "summary")
+            self.assertTrue(review["apply_ready"])
             self.assertNotIn("diff", review["outputs"][0])
-            self.assertEqual(review["outputs"][0]["outline"]["title"], "示例知识")
+            self.assertNotIn("source_contexts", review["outputs"][0])
+            self.assertNotIn("base_sha256", review["outputs"][0])
+            self.assertEqual(review["outputs"][0]["title"], "示例知识")
+            self.assertEqual(review["output_count"], 1)
+            self.assertEqual(review["returned_output_count"], 1)
             self.assertFalse(any(run_root.rglob("*.diff")))
             run = json.loads((run_root / "run.json").read_text(encoding="utf-8"))
             self.assertEqual(run["outputs"][0]["target_path"], "topics/example.md")
             self.assertEqual(run["issues"][0]["kind"], "time_sensitive")
+            self.assertEqual(len(run["review"]["entries"]), 1)
             self.assertIsNone(run["approval"])
 
+            invalid_detail_code, _, invalid_detail_stderr = self.run_cli(
+                [
+                    "prepare-review",
+                    str(run_root),
+                    "--target",
+                    "topics/example.md",
+                ],
+                metadata_input,
+            )
+            self.assertEqual(invalid_detail_code, 2)
+            self.assertIn("--full-diff", invalid_detail_stderr)
+
             full_code, full_review, full_stderr = self.run_cli(
-                ["prepare-review", str(run_root), "--full-diff"],
+                [
+                    "prepare-review",
+                    str(run_root),
+                    "--full-diff",
+                    "--target",
+                    "topics/example.md",
+                ],
                 metadata_input,
             )
             self.assertEqual(full_code, 0, full_stderr)
+            self.assertEqual(full_review["presentation"], "full_diff")
+            self.assertTrue(full_review["apply_ready"])
+            self.assertEqual(full_review["output_count"], 1)
+            self.assertEqual(full_review["returned_output_count"], 1)
             self.assertIn(
                 "+++ b/topics/example.md", full_review["outputs"][0]["diff"]
+            )
+            self.assertIn("source_contexts", full_review["outputs"][0])
+            self.assertLess(
+                len(json.dumps(review, ensure_ascii=False)) * 3,
+                len(json.dumps(full_review, ensure_ascii=False)),
             )
 
             missing_code, _, missing_stderr = self.run_cli(
@@ -769,6 +962,37 @@ class RuntimeTests(unittest.TestCase):
                 proposed.read_bytes(),
             )
             self.assertFalse((run_root / "apply-state.json").exists())
+
+    def test_summary_review_is_sufficient_for_apply(self) -> None:
+        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
+            root = Path(directory)
+            knowledge_root, input_path = create_inputs(root)
+            run_root, _ = runtime.initialize_run(
+                knowledge_root, input_path, "summary-apply"
+            )
+            proposed = run_root / "proposed" / "example.md"
+            proposed.write_text(
+                "# 示例\n\n## 1. 内容\n\n简报审核后的内容。\n",
+                encoding="utf-8",
+            )
+            review_code, review, review_stderr = self.run_cli(
+                ["prepare-review", str(run_root)],
+                review_metadata(run_root, ["example.md"]),
+            )
+            self.assertEqual(review_code, 0, review_stderr)
+            self.assertEqual(review["presentation"], "summary")
+            self.assertTrue(review["apply_ready"])
+            self.assertNotIn("diff", review["outputs"][0])
+
+            apply_code, applied, apply_stderr = self.run_cli(
+                ["apply", str(run_root), "--approve", "example.md"]
+            )
+            self.assertEqual(apply_code, 0, apply_stderr)
+            self.assertEqual(applied["applied_file_count"], 1)
+            self.assertEqual(
+                (knowledge_root / "example.md").read_bytes(),
+                proposed.read_bytes(),
+            )
 
     def test_review_metadata_precisely_maps_and_validates_sources(self) -> None:
         with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
@@ -798,7 +1022,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertIn("标准输入", missing_stderr)
 
             invalid = {
-                "format": "conversation-knowledge-curator.review-input.v2",
+                "format": "conversation-knowledge-curator.review-input.v3",
                 "outputs": [
                     {
                         "target_path": path,
@@ -808,6 +1032,8 @@ class RuntimeTests(unittest.TestCase):
                                 "message_ids": ["unknown-message"],
                             }
                         ],
+                        "evidence_kinds": ["conversation_statement"],
+                        "official_references": [],
                     }
                     for path in ("one.md", "two.md")
                 ],
@@ -824,25 +1050,82 @@ class RuntimeTests(unittest.TestCase):
             )
             self.assertEqual(unchanged["outputs"], [])
 
-            valid = {
-                "format": "conversation-knowledge-curator.review-input.v2",
+            out_of_order = {
+                "format": "conversation-knowledge-curator.review-input.v3",
                 "outputs": [
                     {
                         "target_path": path,
                         "sources": [
                             {
                                 "conversation_ref": conversation["conversation_ref"],
-                                "message_ids": [message_id],
+                                "message_ids": list(reversed(message_ids[:2])),
                             }
                         ],
+                        "evidence_kinds": ["conversation_statement"],
+                        "official_references": [],
                     }
-                    for path, message_id in zip(
-                        ("one.md", "two.md"), message_ids[:2], strict=True
-                    )
+                    for path in ("one.md", "two.md")
                 ],
                 "issues": [],
             }
-            valid_code, _, valid_stderr = self.run_cli(
+            order_code, _, order_stderr = self.run_cli(
+                ["prepare-review", str(run_root)],
+                json.dumps(out_of_order, ensure_ascii=False),
+            )
+            self.assertEqual(order_code, 2)
+            self.assertIn("原对话顺序", order_stderr)
+            self.assertEqual(
+                json.loads((run_root / "run.json").read_text(encoding="utf-8"))[
+                    "outputs"
+                ],
+                [],
+            )
+
+            valid = {
+                "format": "conversation-knowledge-curator.review-input.v3",
+                "outputs": [
+                    {
+                        "target_path": "one.md",
+                        "sources": [
+                            {
+                                "conversation_ref": conversation["conversation_ref"],
+                                "message_ids": [message_ids[0]],
+                            }
+                        ],
+                        "evidence_kinds": ["conversation_statement"],
+                        "official_references": [],
+                    },
+                    {
+                        "target_path": "two.md",
+                        "sources": [
+                            {
+                                "conversation_ref": conversation["conversation_ref"],
+                                "message_ids": message_ids[:2],
+                            }
+                        ],
+                        "evidence_kinds": ["conversation_statement"],
+                        "official_references": [],
+                    },
+                ],
+                "issues": [
+                    {
+                        "kind": "other",
+                        "message": "整个运行的全局说明。",
+                        "target_path": None,
+                    },
+                    {
+                        "kind": "uncertain",
+                        "message": "第一篇存在待确认边界。",
+                        "target_path": "one.md",
+                    },
+                    {
+                        "kind": "time_sensitive",
+                        "message": "第二篇需要复核版本范围。",
+                        "target_path": "two.md",
+                    },
+                ],
+            }
+            valid_code, review, valid_stderr = self.run_cli(
                 ["prepare-review", str(run_root)],
                 "\ufeff" + json.dumps(valid, ensure_ascii=False),
             )
@@ -855,7 +1138,66 @@ class RuntimeTests(unittest.TestCase):
                 for output in updated["outputs"]
             }
             self.assertEqual(sources_by_target["one.md"], [message_ids[0]])
-            self.assertEqual(sources_by_target["two.md"], [message_ids[1]])
+            self.assertEqual(sources_by_target["two.md"], message_ids[:2])
+            self.assertNotIn("source_contexts", review["outputs"][1])
+            self.assertEqual(len(review["issues"]), 3)
+            self.assertTrue(
+                all(output["issue_count"] == 2 for output in review["outputs"])
+            )
+
+            unknown_code, _, unknown_stderr = self.run_cli(
+                [
+                    "prepare-review",
+                    str(run_root),
+                    "--full-diff",
+                    "--target",
+                    "missing.md",
+                ],
+                json.dumps(valid, ensure_ascii=False),
+            )
+            self.assertEqual(unknown_code, 2)
+            self.assertIn("未知 proposed 目标", unknown_stderr)
+
+            duplicate_code, _, duplicate_stderr = self.run_cli(
+                [
+                    "prepare-review",
+                    str(run_root),
+                    "--full-diff",
+                    "--target",
+                    "two.md",
+                    "--target",
+                    "two.md",
+                ],
+                json.dumps(valid, ensure_ascii=False),
+            )
+            self.assertEqual(duplicate_code, 2)
+            self.assertIn("不得重复", duplicate_stderr)
+
+            detail_code, detail, detail_stderr = self.run_cli(
+                [
+                    "prepare-review",
+                    str(run_root),
+                    "--full-diff",
+                    "--target",
+                    "two.md",
+                ],
+                json.dumps(valid, ensure_ascii=False),
+            )
+            self.assertEqual(detail_code, 0, detail_stderr)
+            self.assertEqual(detail["output_count"], 2)
+            self.assertEqual(detail["returned_output_count"], 1)
+            self.assertEqual(detail["outputs"][0]["target_path"], "two.md")
+            self.assertEqual(
+                {issue["target_path"] for issue in detail["issues"]},
+                {None, "two.md"},
+            )
+            contexts = detail["outputs"][0]["source_contexts"][0]["messages"]
+            self.assertEqual(
+                [message["role"] for message in contexts],
+                ["user", "assistant"],
+            )
+            self.assertTrue(all(message["preview"] for message in contexts))
+            self.assertNotIn("source_contexts", updated["outputs"][1])
             self.assertTrue(
                 all(
                     output["sources"][0]["source_sha256"]
@@ -864,6 +1206,124 @@ class RuntimeTests(unittest.TestCase):
                     == conversation["conversation_id"]
                     for output in updated["outputs"]
                 )
+            )
+
+    def test_assistant_only_source_requires_explicit_risk(self) -> None:
+        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
+            root = Path(directory)
+            knowledge_root, input_path = create_inputs(root)
+            run_root, _ = runtime.initialize_run(
+                knowledge_root, input_path, "assistant-only"
+            )
+            (run_root / "proposed" / "example.md").write_text(
+                "# 示例\n\n## 1. 内容\n\n内容。\n", encoding="utf-8"
+            )
+            _, source, document = runtime.load_run(run_root)
+            _, metadata = runtime.current_view(source, document)
+            conversation = metadata["conversations"][0]
+            assistant_id = next(
+                message["message_id"]
+                for message in conversation["messages"]
+                if message["role"] == "assistant"
+            )
+            review_input = {
+                "format": "conversation-knowledge-curator.review-input.v3",
+                "outputs": [
+                    {
+                        "target_path": "example.md",
+                        "sources": [
+                            {
+                                "conversation_ref": conversation["conversation_ref"],
+                                "message_ids": [assistant_id],
+                            }
+                        ],
+                        "evidence_kinds": [
+                            "conversation_statement",
+                            "engineering_judgment",
+                        ],
+                        "official_references": [],
+                    }
+                ],
+                "issues": [],
+            }
+
+            rejected_code, _, rejected_stderr = self.run_cli(
+                ["prepare-review", str(run_root)],
+                json.dumps(review_input, ensure_ascii=False),
+            )
+            self.assertEqual(rejected_code, 2)
+            self.assertIn("assistant_only", rejected_stderr)
+            unchanged = json.loads(
+                (run_root / "run.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(unchanged["outputs"], [])
+
+            review_input["issues"] = [
+                {
+                    "kind": "assistant_only",
+                    "message": "缺少直接前置的用户问题，按工程判断保留。",
+                    "target_path": "example.md",
+                }
+            ]
+            accepted_code, review, accepted_stderr = self.run_cli(
+                ["prepare-review", str(run_root)],
+                json.dumps(review_input, ensure_ascii=False),
+            )
+            self.assertEqual(accepted_code, 0, accepted_stderr)
+            self.assertEqual(review["issues"][0]["kind"], "assistant_only")
+
+    def test_official_reference_must_be_preserved_in_proposed(self) -> None:
+        with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:
+            root = Path(directory)
+            knowledge_root, input_path = create_inputs(root)
+            run_root, _ = runtime.initialize_run(
+                knowledge_root, input_path, "official-reference"
+            )
+            proposed = run_root / "proposed" / "example.md"
+            proposed.write_text(
+                "# 示例\n\n## 1. 内容\n\n已经核验的内容。\n", encoding="utf-8"
+            )
+            metadata = json.loads(
+                review_metadata(run_root, ["example.md"])
+            )
+            metadata["outputs"][0]["evidence_kinds"].append(
+                "official_verification"
+            )
+            reference = {
+                "title": "示例官方文档",
+                "url": "https://example.com/official",
+                "supports": "支持示例结论",
+            }
+            metadata["outputs"][0]["official_references"] = [reference]
+
+            rejected_code, _, rejected_stderr = self.run_cli(
+                ["prepare-review", str(run_root)],
+                json.dumps(metadata, ensure_ascii=False),
+            )
+            self.assertEqual(rejected_code, 2)
+            self.assertIn("未保留登记的官方资料链接", rejected_stderr)
+            self.assertEqual(
+                json.loads((run_root / "run.json").read_text(encoding="utf-8"))[
+                    "outputs"
+                ],
+                [],
+            )
+
+            proposed.write_text(
+                (
+                    "# 示例\n\n## 1. 内容\n\n已经核验的内容。\n\n"
+                    "## 2. 参考资料\n\n"
+                    "- [示例官方文档](https://example.com/official)\n"
+                ),
+                encoding="utf-8",
+            )
+            accepted_code, review, accepted_stderr = self.run_cli(
+                ["prepare-review", str(run_root)],
+                json.dumps(metadata, ensure_ascii=False),
+            )
+            self.assertEqual(accepted_code, 0, accepted_stderr)
+            self.assertEqual(
+                review["outputs"][0]["official_reference_count"], 1
             )
 
     def test_modified_proposed_invalidates_review_binding(self) -> None:
@@ -878,7 +1338,7 @@ class RuntimeTests(unittest.TestCase):
                 "# 示例\n\n## 1. 初始内容\n\n内容。\n", encoding="utf-8"
             )
             code, _, stderr = self.run_cli(
-                ["prepare-review", str(run_root)],
+                ["prepare-review", str(run_root), "--full-diff"],
                 review_metadata(run_root, ["example.md"]),
             )
             self.assertEqual(code, 0, stderr)
@@ -929,43 +1389,37 @@ class RuntimeTests(unittest.TestCase):
                 item for item in review["outputs"]
                 if item["target_path"] == "new.md"
             )
-            self.assertFalse(update_item["diff_included"])
             self.assertNotIn("diff", update_item)
-            self.assertEqual(
-                update_item["diff_summary"]["added_headings"],
-                [{"level": 2, "text": "2. 新章节"}],
-            )
-            self.assertEqual(
-                update_item["diff_summary"]["removed_headings"],
-                [],
-            )
-            self.assertEqual(
-                update_item["diff_summary"]["changed_sections"],
-                [
-                    {
-                        "heading_path": ["已有", "1. 原内容"],
-                        "ordinal": 0,
-                    }
-                ],
-            )
-            self.assertGreater(
-                update_item["diff_summary"]["added_line_count"],
-                0,
-            )
-            self.assertFalse(create_item["diff_included"])
+            self.assertEqual(update_item["added_heading_count"], 1)
+            self.assertEqual(update_item["removed_heading_count"], 0)
+            self.assertEqual(update_item["changed_section_count"], 1)
+            self.assertGreater(update_item["added_line_count"], 0)
             self.assertNotIn("diff", create_item)
             self.assertNotIn("diff_summary", create_item)
+            self.assertEqual(create_item["change"], "create")
+            self.assertGreater(create_item["line_count"], 0)
 
             full_code, full_review, full_stderr = self.run_cli(
-                ["prepare-review", str(run_root), "--full-diff"],
+                [
+                    "prepare-review",
+                    str(run_root),
+                    "--full-diff",
+                    "--target",
+                    "existing.md",
+                ],
                 review_metadata(run_root, ["existing.md", "new.md"]),
             )
             self.assertEqual(full_code, 0, full_stderr)
-            self.assertTrue(
-                all(item["diff_included"] for item in full_review["outputs"])
+            self.assertEqual(full_review["output_count"], 2)
+            self.assertEqual(full_review["returned_output_count"], 1)
+            self.assertEqual(
+                full_review["outputs"][0]["target_path"], "existing.md"
             )
-            self.assertTrue(
-                all("diff" in item for item in full_review["outputs"])
+            self.assertTrue(full_review["outputs"][0]["diff_included"])
+            self.assertIn("diff", full_review["outputs"][0])
+            self.assertEqual(
+                full_review["outputs"][0]["diff_summary"]["added_headings"],
+                [{"level": 2, "text": "2. 新章节"}],
             )
             existing.write_text(
                 "# 已有\n\n## 1. 外部修改\n\n外部修改。\n", encoding="utf-8"
@@ -999,7 +1453,7 @@ class RuntimeTests(unittest.TestCase):
                 "# 新文档\n\n## 1. 内容\n\n内容。\n", encoding="utf-8"
             )
             code, _, stderr = self.run_cli(
-                ["prepare-review", str(run_root)],
+                ["prepare-review", str(run_root), "--full-diff"],
                 review_metadata(run_root, ["new.md"]),
             )
             self.assertEqual(code, 0, stderr)
@@ -1033,7 +1487,7 @@ class RuntimeTests(unittest.TestCase):
                 "# 二\n\n## 1. 内容\n\n内容。\n", encoding="utf-8"
             )
             code, _, stderr = self.run_cli(
-                ["prepare-review", str(run_root)],
+                ["prepare-review", str(run_root), "--full-diff"],
                 review_metadata(run_root, ["one.md", "two.md"]),
             )
             self.assertEqual(code, 0, stderr)
@@ -1095,7 +1549,7 @@ class RuntimeTests(unittest.TestCase):
                 "# 示例\n\n## 1. 新内容\n\n新内容。\n", encoding="utf-8"
             )
             code, _, stderr = self.run_cli(
-                ["prepare-review", str(run_root)],
+                ["prepare-review", str(run_root), "--full-diff"],
                 review_metadata(run_root, ["example.md"]),
             )
             self.assertEqual(code, 0, stderr)
