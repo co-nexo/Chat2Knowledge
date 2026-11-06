@@ -17,6 +17,7 @@
 13. 收件箱按输入哈希区分待处理、可恢复、待审核和已处理，内容变化后重新待处理。
 14. 无效或不支持的投递单元不会创建正式 Run，并以精简诊断返回。
 15. 已应用组合 Run 中的单个来源再次出现时，不会被拆开重复处理。
+16. 只有已应用 Run 才能把原投递单元移入独立归档目录，重复归档安全返回。
 
 已覆盖的审核与应用行为：
 
@@ -209,8 +210,11 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(configure_code, 0, configure_stderr)
             self.assertEqual(
                 configured["format"],
-                "conversation-knowledge-curator.local-settings.v1",
+                "conversation-knowledge-curator.local-settings.v2",
             )
+            processed_dir = Path(str(configured["processed_dir"]))
+            self.assertEqual(processed_dir, input_dir / "_processed")
+            self.assertTrue(processed_dir.is_dir())
 
             inbox_code, inbox, inbox_stderr = self.run_cli(
                 ["inbox", "--settings", str(settings)]
@@ -250,6 +254,69 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(rescanned_code, 0, rescanned_stderr)
             self.assertEqual(rescanned["summary"]["pending"], 1)
             self.assertEqual(rescanned["summary"]["resumable"], 1)
+
+            run_directory = Path(str(initialized["run_directory"]))
+            rejected_code, rejected, rejected_stderr = self.run_cli(
+                [
+                    "archive-inbox",
+                    str(run_directory),
+                    "--settings",
+                    str(settings),
+                ]
+            )
+            self.assertEqual(rejected_code, 2)
+            self.assertEqual(rejected, {})
+            self.assertIn("成功应用", rejected_stderr)
+            self.assertTrue((input_dir / "single.json").is_file())
+
+            _, _, document = runtime.load_run(run_directory)
+            document["status"] = "applied"
+            document["apply"] = {"status": "applied", "entries": []}
+            runtime.save_run(run_directory, document)
+            (input_dir / "single.json").write_text("[]\n", encoding="utf-8")
+            changed_code, changed_result, changed_stderr = self.run_cli(
+                [
+                    "archive-inbox",
+                    str(run_directory),
+                    "--settings",
+                    str(settings),
+                ]
+            )
+            self.assertEqual(changed_code, 2)
+            self.assertEqual(changed_result, {})
+            self.assertIn("变化", changed_stderr)
+            self.assertTrue((input_dir / "single.json").is_file())
+            shutil.copyfile(FIXTURE, input_dir / "single.json")
+            archive_code, archived, archive_stderr = self.run_cli(
+                [
+                    "archive-inbox",
+                    str(run_directory),
+                    "--settings",
+                    str(settings),
+                ]
+            )
+            self.assertEqual(archive_code, 0, archive_stderr)
+            self.assertEqual(archived["status"], "archived")
+            archived_path = Path(str(archived["archived_path"]))
+            self.assertTrue(archived_path.is_file())
+            self.assertEqual(archived_path.parent.name, unit_ref)
+            self.assertFalse((input_dir / "single.json").exists())
+
+            repeat_archive_code, repeat_archive, repeat_archive_stderr = self.run_cli(
+                [
+                    "archive-inbox",
+                    str(run_directory),
+                    "--settings",
+                    str(settings),
+                ]
+            )
+            self.assertEqual(repeat_archive_code, 0, repeat_archive_stderr)
+            self.assertEqual(repeat_archive["status"], "already_archived")
+
+            final_report = runtime.inspect_inbox(settings)
+            self.assertEqual(final_report["summary"]["pending"], 0)
+            self.assertEqual(final_report["summary"]["processed"], 1)
+            self.assertEqual(final_report["summary"]["ignored"], 1)
 
     def test_inbox_content_change_becomes_new_pending_unit(self) -> None:
         with tempfile.TemporaryDirectory(dir=WORKSPACE_ROOT) as directory:

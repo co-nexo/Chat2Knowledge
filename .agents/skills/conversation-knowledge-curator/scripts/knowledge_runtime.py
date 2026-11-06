@@ -26,7 +26,7 @@ VISIBLE_FORMAT = "conversation-knowledge-curator.visible-input.v3"
 CONTEXT_FORMAT = "conversation-knowledge-curator.context.v1"
 REVIEW_FORMAT = "conversation-knowledge-curator.review.v5"
 REVIEW_INPUT_FORMAT = "conversation-knowledge-curator.review-input.v3"
-LOCAL_SETTINGS_FORMAT = "conversation-knowledge-curator.local-settings.v1"
+LOCAL_SETTINGS_FORMAT = "conversation-knowledge-curator.local-settings.v2"
 INBOX_FORMAT = "conversation-knowledge-curator.inbox.v1"
 RUN_ID_PATTERN = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
 RUN_RELATIVE_ROOT = PurePosixPath(".knowledge-curator/runs")
@@ -147,7 +147,13 @@ def validate_local_settings(document: object) -> dict[str, object]:
         raise RunError("本地配置必须是 JSON 对象")
     require_exact_fields(
         document,
-        {"format", "input_dir", "knowledge_root", "branch_policy"},
+        {
+            "format",
+            "input_dir",
+            "processed_dir",
+            "knowledge_root",
+            "branch_policy",
+        },
         "本地配置",
     )
     if document["format"] != LOCAL_SETTINGS_FORMAT:
@@ -157,14 +163,14 @@ def validate_local_settings(document: object) -> dict[str, object]:
         )
     if document["branch_policy"] not in {"active", "all"}:
         raise RunError("本地配置 branch_policy 只允许 active 或 all")
-    for field in ("input_dir", "knowledge_root"):
+    for field in ("input_dir", "processed_dir", "knowledge_root"):
         if not isinstance(document[field], str) or not document[field]:
             raise RunError(f"本地配置 {field} 必须是非空字符串")
     return document
 
 
 def load_local_settings(settings_path: Path) -> dict[str, object]:
-    """读取本地固定目录配置，并重新校验两个目录。"""
+    """读取本地固定目录配置，并重新校验三个目录。"""
 
     if knowledge_inventory.is_link_like(settings_path):
         raise RunError(f"本地配置不得是链接：{settings_path}")
@@ -176,12 +182,18 @@ def load_local_settings(settings_path: Path) -> dict[str, object]:
         raise RunError(f"无法读取本地配置：{settings_path}") from exc
     settings = validate_local_settings(document)
     input_dir = resolve_directory(Path(str(settings["input_dir"])), "固定输入目录")
+    processed_dir = resolve_directory(
+        Path(str(settings["processed_dir"])), "已处理目录"
+    )
     knowledge_root = resolve_directory(
         Path(str(settings["knowledge_root"])), "固定知识库根目录"
     )
+    if len({input_dir, processed_dir, knowledge_root}) != 3:
+        raise RunError("输入目录、已处理目录和知识库根目录必须互不相同")
     return {
         "format": LOCAL_SETTINGS_FORMAT,
         "input_dir": str(input_dir),
+        "processed_dir": str(processed_dir),
         "knowledge_root": str(knowledge_root),
         "branch_policy": settings["branch_policy"],
     }
@@ -193,15 +205,25 @@ def configure_inbox(
     knowledge_root: Path,
     branch_policy: str,
 ) -> dict[str, object]:
-    """校验固定目录并原子写入仅供本机使用的配置。"""
+    """校验固定目录、创建默认归档目录并写入本机配置。"""
 
     resolved_input = resolve_directory(input_dir, "固定输入目录")
     resolved_knowledge = resolve_directory(knowledge_root, "固定知识库根目录")
     if resolved_input == resolved_knowledge:
         raise RunError("固定输入目录和知识库根目录不得相同")
+    processed_path = resolved_input / "_processed"
+    if processed_path.exists():
+        processed_dir = resolve_directory(processed_path, "已处理目录")
+    else:
+        try:
+            processed_path.mkdir()
+        except OSError as exc:
+            raise RunError(f"无法创建已处理目录：{processed_path}") from exc
+        processed_dir = processed_path.resolve(strict=True)
     settings = {
         "format": LOCAL_SETTINGS_FORMAT,
         "input_dir": str(resolved_input),
+        "processed_dir": str(processed_dir),
         "knowledge_root": str(resolved_knowledge),
         "branch_policy": branch_policy,
     }
@@ -213,7 +235,10 @@ def configure_inbox(
     }
 
 
-def discover_inbox_paths(input_dir: Path) -> tuple[list[Path], list[dict[str, str]]]:
+def discover_inbox_paths(
+    input_dir: Path,
+    processed_dir: Path,
+) -> tuple[list[Path], list[dict[str, str]]]:
     """把收件箱一级 JSON、ZIP 和子目录发现为独立投递单元。"""
 
     units: list[Path] = []
@@ -225,6 +250,8 @@ def discover_inbox_paths(input_dir: Path) -> tuple[list[Path], list[dict[str, st
     except OSError as exc:
         raise RunError(f"无法扫描固定输入目录：{input_dir}") from exc
     for entry in entries:
+        if entry.resolve(strict=False) == processed_dir:
+            continue
         if knowledge_inventory.is_link_like(entry):
             ignored.append({"name": entry.name, "reason": "link_like"})
             continue
@@ -363,8 +390,9 @@ def inspect_inbox(settings_path: Path) -> dict[str, object]:
 
     settings = load_local_settings(settings_path)
     input_dir = Path(str(settings["input_dir"]))
+    processed_dir = Path(str(settings["processed_dir"]))
     knowledge_root = Path(str(settings["knowledge_root"]))
-    units, ignored = discover_inbox_paths(input_dir)
+    units, ignored = discover_inbox_paths(input_dir, processed_dir)
     history, applied_sources = run_history_by_input(knowledge_root)
     pending: list[dict[str, object]] = []
     resumable: list[dict[str, object]] = []
@@ -395,6 +423,7 @@ def inspect_inbox(settings_path: Path) -> dict[str, object]:
         "format": INBOX_FORMAT,
         "settings_path": str(settings_path.resolve()),
         "input_dir": str(input_dir),
+        "processed_dir": str(processed_dir),
         "knowledge_root": str(knowledge_root),
         "summary": {
             "pending": len(pending),
@@ -419,8 +448,9 @@ def initialize_inbox_unit(settings_path: Path, unit_ref: str) -> dict[str, objec
         raise RunError("unit_ref 必须是 inbox 返回的 64 位小写 SHA-256")
     settings = load_local_settings(settings_path)
     input_dir = Path(str(settings["input_dir"]))
+    processed_dir = Path(str(settings["processed_dir"]))
     knowledge_root = Path(str(settings["knowledge_root"]))
-    units, _ = discover_inbox_paths(input_dir)
+    units, _ = discover_inbox_paths(input_dir, processed_dir)
     history, applied_sources = run_history_by_input(knowledge_root)
     matches: list[tuple[Path, dict[str, object]]] = []
     for path in units:
@@ -465,6 +495,61 @@ def initialize_inbox_unit(settings_path: Path, unit_ref: str) -> dict[str, objec
         "conversation_count": parsing["conversation_count"],
         "message_count": parsing["message_count"],
         "batch_count": len(parsing["batches"]),
+    }
+
+
+def archive_inbox_run(settings_path: Path, run_directory: Path) -> dict[str, object]:
+    """把已成功应用的收件箱投递单元原子移动到已处理目录。"""
+
+    settings = load_local_settings(settings_path)
+    input_dir = Path(str(settings["input_dir"]))
+    processed_dir = Path(str(settings["processed_dir"]))
+    knowledge_root = Path(str(settings["knowledge_root"]))
+    root, source, document = load_run(run_directory)
+    if root != knowledge_root:
+        raise RunError("该 Run 不属于本地配置绑定的知识库")
+    if document["status"] != "applied":
+        raise RunError("只有成功应用的 Run 才能归档输入")
+    if source.parent.resolve(strict=False) != input_dir:
+        raise RunError("该 Run 的输入不是收件箱中的一级投递单元")
+    input_value = document["input"]
+    assert isinstance(input_value, dict)
+    unit_ref = str(input_value["sha256"])
+    if not SHA256_PATTERN.fullmatch(unit_ref):
+        raise RunError("Run 的输入哈希无效")
+    bucket = processed_dir / unit_ref
+    target = bucket / source.name
+    if bucket.exists():
+        if knowledge_inventory.is_link_like(bucket) or not bucket.is_dir():
+            raise RunError(f"归档目标必须是普通目录：{bucket}")
+        entries = list(bucket.iterdir())
+        if target.exists() and len(entries) == 1:
+            return {
+                "status": "already_archived",
+                "unit_ref": unit_ref,
+                "archived_path": str(target.resolve()),
+            }
+        if entries:
+            raise RunError(f"归档目标存在冲突，拒绝覆盖：{bucket}")
+    if not source.exists():
+        raise RunError("原始投递单元不存在，且未找到已完成的归档")
+    current_view(source, document)
+    if knowledge_inventory.is_link_like(source):
+        raise RunError(f"拒绝移动链接：{source}")
+    try:
+        bucket.mkdir(exist_ok=True)
+        source.rename(target)
+    except OSError as exc:
+        try:
+            bucket.rmdir()
+        except OSError:
+            pass
+        raise RunError(f"无法移动投递单元到已处理目录：{source}") from exc
+    return {
+        "status": "archived",
+        "unit_ref": unit_ref,
+        "original_path": str(source),
+        "archived_path": str(target.resolve()),
     }
 
 
@@ -2651,6 +2736,8 @@ def execute_command(args: argparse.Namespace) -> tuple[dict[str, object], int]:
         return inspect_inbox(args.settings), 0
     if args.command == "init-inbox":
         return initialize_inbox_unit(args.settings, args.unit_ref), 0
+    if args.command == "archive-inbox":
+        return archive_inbox_run(args.settings, args.run_directory), 0
     if args.command == "init":
         run_root, document = initialize_run(
             args.knowledge_root, args.input_path, args.run_id, args.branch
@@ -2723,6 +2810,14 @@ def create_parser() -> argparse.ArgumentParser:
     )
     inbox_init_parser.add_argument("unit_ref")
     inbox_init_parser.add_argument(
+        "--settings", type=Path, default=DEFAULT_SETTINGS_PATH, help=argparse.SUPPRESS
+    )
+
+    archive_parser = subparsers.add_parser(
+        "archive-inbox", help="把已应用 Run 的输入移动到已处理目录"
+    )
+    archive_parser.add_argument("run_directory", type=Path)
+    archive_parser.add_argument(
         "--settings", type=Path, default=DEFAULT_SETTINGS_PATH, help=argparse.SUPPRESS
     )
 
